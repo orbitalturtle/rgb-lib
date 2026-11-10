@@ -23,6 +23,7 @@ pub struct Model {
     pub expiration: Option<i64>,
     pub min_confirmations: u8,
     pub incoming: bool,
+    pub apply_when_final: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -35,6 +36,7 @@ pub enum Column {
     Expiration,
     MinConfirmations,
     Incoming,
+    ApplyWhenFinal,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -66,6 +68,7 @@ impl ColumnTrait for Column {
             Self::Expiration => ColumnType::BigInteger.def().null(),
             Self::MinConfirmations => ColumnType::SmallInteger.def(),
             Self::Incoming => ColumnType::Boolean.def(),
+            Self::ApplyWhenFinal => ColumnType::Boolean.def().default(false),
         }
     }
 }
