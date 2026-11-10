@@ -72,6 +72,13 @@ pub enum Error {
         details: String,
     },
 
+    /// The batch transfer cannot be set to apply its RGB state only once final
+    #[error("Cannot set apply when final: {details}")]
+    CannotSetApplyWhenFinal {
+        /// Error details
+        details: String,
+    },
+
     /// Cannot use IFA schema on mainnet
     #[error("Cannot use IFA schema on mainnet")]
     CannotUseIfaOnMainnet,

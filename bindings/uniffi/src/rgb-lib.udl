@@ -23,6 +23,7 @@ interface RgbLibError {
   CannotFinalizePsbt();
   CannotProvideOutOfBandAck(string details);
   CannotProvideOutOfBandConsignment(string details);
+  CannotSetApplyWhenFinal(string details);
   CannotUseIfaOnMainnet();
   Database(string details);
   EmptyFile(string file_path);

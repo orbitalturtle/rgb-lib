@@ -407,6 +407,59 @@ impl Wallet {
         ))
     }
 
+    /// Defer applying the RGB state of an outgoing transfer until its transaction is final.
+    ///
+    /// By default the RGB fascia of an outgoing transfer is applied to the RGB state when its
+    /// transaction is broadcast. After calling this method on a batch transfer, the transaction is
+    /// still broadcast as usual but the fascia is applied only once the transaction reaches the
+    /// batch transfer's `min_confirmations`, right before the transfer becomes
+    /// [`TransferStatus::Settled`]. Until then the RGB state is left untouched, so a transaction
+    /// that never confirms leaves no trace in it.
+    ///
+    /// It can only be called on an outgoing batch transfer in [`TransferStatus::Initiated`] status
+    /// (i.e. after a `*_begin` call and before the matching `*_end` call) with a
+    /// `min_confirmations` of at least 1.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    pub fn set_apply_when_final(&mut self, batch_transfer_idx: i32) -> Result<(), Error> {
+        info!(
+            self.logger(),
+            "Setting apply when final for batch transfer {batch_transfer_idx}..."
+        );
+        let txn = self.database().begin_transaction()?;
+        let batch_transfer =
+            txn.get_batch_transfer_or_fail(batch_transfer_idx, &txn.iter_batch_transfers()?)?;
+        if batch_transfer.incoming {
+            return Err(Error::CannotSetApplyWhenFinal {
+                details: s!("batch transfer is incoming"),
+            });
+        }
+        if batch_transfer.status != TransferStatus::Initiated {
+            return Err(Error::CannotSetApplyWhenFinal {
+                details: format!(
+                    "batch transfer must be in Initiated status, found {:?}",
+                    batch_transfer.status
+                ),
+            });
+        }
+        if batch_transfer.min_confirmations == 0 {
+            return Err(Error::CannotSetApplyWhenFinal {
+                details: s!("batch transfer must require at least 1 confirmation"),
+            });
+        }
+        if !batch_transfer.apply_when_final {
+            let mut updated: DbBatchTransferActMod = batch_transfer.into();
+            updated.apply_when_final = ActiveValue::Set(true);
+            txn.update_batch_transfer(&mut updated)?;
+            self.update_backup_info(&txn, false)?;
+        }
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Set apply when final completed");
+        Ok(())
+    }
+
     /// Consume an RGB fascia.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use

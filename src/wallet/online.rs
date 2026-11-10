@@ -169,16 +169,47 @@ pub trait WalletOnline: WalletOffline {
         Ok(())
     }
 
+    /// Broadcast a colored transaction and, unless `apply_when_final` is set, apply its RGB
+    /// fascia right away. When it is set the fascia stays in the transfer directory and is applied
+    /// by [`wait_confirmations`](Self::wait_confirmations) once the transaction reaches the batch
+    /// transfer's `min_confirmations`.
     fn broadcast_and_update_rgb(
         &mut self,
         txn: &DbTxn,
         runtime: &mut RgbRuntime,
         signed_psbt: &Psbt,
         fascia: Fascia,
+        apply_when_final: bool,
     ) -> Result<BdkTransaction, Error> {
         let tx = self.broadcast_psbt(txn, signed_psbt)?;
-        runtime.consume_fascia(fascia, None)?;
+        if apply_when_final {
+            debug!(
+                self.logger(),
+                "Deferring RGB fascia application until the TX is final"
+            );
+        } else {
+            runtime.consume_fascia(fascia, None)?;
+        }
         Ok(tx)
+    }
+
+    /// Apply the RGB fascia of an outgoing batch transfer whose application was deferred until its
+    /// transaction became final.
+    fn apply_deferred_fascia(&self, batch_transfer: &DbBatchTransfer) -> Result<(), Error> {
+        let txid = batch_transfer
+            .txid
+            .as_ref()
+            .expect("batch transfer should have a TXID");
+        let transfer_dir = self.get_transfers_dir().join(txid);
+        let fascia = self.read_transfer_fascia(&transfer_dir)?;
+        if fascia.witness_id().to_string() != *txid {
+            return Err(Error::Inconsistency {
+                details: format!("fascia of transfer {txid} commits to a different TX"),
+            });
+        }
+        debug!(self.logger(), "Applying deferred RGB fascia for TX {txid}");
+        self.rgb_runtime()?.consume_fascia(fascia, None)?;
+        Ok(())
     }
 
     fn create_split_tx(
@@ -1783,7 +1814,13 @@ pub trait WalletOnline: WalletOffline {
         let signed_psbt = self.get_signed_psbt(&transfer_dir)?;
         let mut runtime = self.rgb_runtime()?;
         let fascia = self.read_transfer_fascia(&transfer_dir)?;
-        self.broadcast_and_update_rgb(txn, &mut runtime, &signed_psbt, fascia)?;
+        self.broadcast_and_update_rgb(
+            txn,
+            &mut runtime,
+            &signed_psbt,
+            fascia,
+            batch_transfer.apply_when_final,
+        )?;
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
 
@@ -2008,6 +2045,8 @@ pub trait WalletOnline: WalletOffline {
                     txn.update_asset(&mut updated_asset)?;
                 }
             }
+        } else if batch_transfer.apply_when_final {
+            self.apply_deferred_fascia(batch_transfer)?;
         }
 
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
@@ -3382,8 +3421,13 @@ pub trait WalletOnline: WalletOffline {
         fascia: Fascia,
         sync_tte_used: bool,
     ) -> Result<i32, Error> {
+        let apply_when_final = txn
+            .get_batch_transfers_by_txid(&txid)?
+            .into_iter()
+            .find(|batch_transfer| !batch_transfer.incoming)
+            .is_some_and(|batch_transfer| batch_transfer.apply_when_final);
         let mut runtime = self.rgb_runtime()?;
-        self.broadcast_and_update_rgb(txn, &mut runtime, psbt, fascia)?;
+        self.broadcast_and_update_rgb(txn, &mut runtime, psbt, fascia, apply_when_final)?;
         self.update_or_save_transfers(txn, txid, info_contents, status, sync_tte_used)
     }
 
