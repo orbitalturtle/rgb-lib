@@ -485,6 +485,19 @@ pub trait WalletOnline: WalletOffline {
         }
     }
 
+    /// Whether the batch transfer is in [`TransferStatus::Initiated`] status but its TX is already
+    /// known to the indexer (e.g. it was broadcast without calling the matching `*_end`). Such a
+    /// transfer may still confirm, so failing it and releasing its UTXOs would be unsafe.
+    fn initiated_tx_known(&self, batch_transfer: &DbBatchTransfer) -> Result<bool, Error> {
+        if batch_transfer.status != TransferStatus::Initiated {
+            return Ok(false);
+        }
+        let Some(txid) = &batch_transfer.txid else {
+            return Ok(false);
+        };
+        Ok(self.indexer().get_tx_confirmations(txid)?.is_some())
+    }
+
     fn fail_transfers_impl(
         &mut self,
         txn: &DbTxn,
@@ -511,7 +524,7 @@ pub trait WalletOnline: WalletOffline {
             let batch_transfer =
                 txn.get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
 
-            if !batch_transfer.is_fallible() {
+            if !batch_transfer.is_fallible() || self.initiated_tx_known(&batch_transfer)? {
                 return Ok(FailTransfersOutcome {
                     transfers_changed: false,
                     cannot_fail: true,
@@ -555,6 +568,9 @@ pub trait WalletOnline: WalletOffline {
                 let expired = t.expiration.unwrap_or(now) < now;
                 expired && t.is_fallible()
             }) {
+                if self.initiated_tx_known(batch_transfer)? {
+                    continue;
+                }
                 if no_asset_only {
                     let connected_assets = batch_transfer
                         .get_asset_transfers(&db_data.asset_transfers)
@@ -4111,6 +4127,8 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
     /// Transfers are eligible if they remain in a fallible status after a `refresh` has been
     /// performed. A transfer in status [`TransferStatus::WaitingBroadcast`] is an exception: it can
     /// only be failed once it has expired, since the TX may still be broadcast before then.
+    /// A transfer in status [`TransferStatus::Initiated`] whose TX is already known to the indexer
+    /// (i.e. it has been broadcast) is never failed, since the TX may still confirm.
     fn fail_transfers(
         &mut self,
         online: Online,

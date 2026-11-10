@@ -681,3 +681,86 @@ fn waiting_safe_height() {
         TransferStatus::Failed
     ));
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn initiated_tx_known() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // 3 allocations, so 3 transfers can be initiated independently
+    let asset = party.issue_asset_nia(Some(&[AMOUNT, AMOUNT, AMOUNT]));
+
+    let mut begin_send = |party: &mut SinglesigParty, expiration_timestamp: u64| {
+        let receive_data = rcv_party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map,
+                false,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                expiration_timestamp,
+                false,
+            )
+            .unwrap()
+    };
+    // sign and broadcast the TX of an initiated transfer without calling send_end
+    let broadcast_without_end = |party: &mut SinglesigParty, psbt: String| {
+        let signed_psbt = party.wallet.sign_psbt(psbt, None).unwrap();
+        let tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+        let txid = tx.compute_txid().to_string();
+        party.wallet.indexer().broadcast(&tx).unwrap();
+        assert!(wait_for_function(
+            || party
+                .wallet
+                .indexer()
+                .get_tx_confirmations(&txid)
+                .unwrap()
+                .is_some(),
+            10,
+            500
+        ));
+        txid
+    };
+
+    // single transfer: an Initiated transfer whose TX is known cannot be failed
+    let begin = begin_send(&mut party, default_send_expiration());
+    let batch_transfer_idx = begin.batch_transfer_idx.unwrap();
+    let txid = broadcast_without_end(&mut party, begin.psbt);
+    assert!(matches!(
+        party.fail_transfers(Some(batch_transfer_idx), false, false),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Initiated));
+
+    // expired transfers: an expired Initiated transfer whose TX is known is skipped
+    let expiration_secs = 1;
+    let begin = begin_send(
+        &mut party,
+        (now().unix_timestamp() + expiration_secs) as u64,
+    );
+    let txid_expired = broadcast_without_end(&mut party, begin.psbt);
+    std::thread::sleep(Duration::from_secs(expiration_secs as u64 + 1));
+    assert!(!party.fail_transfers_all());
+    assert!(party.check_test_transfer_status_sender(&txid_expired, TransferStatus::Initiated));
+
+    // an Initiated transfer whose TX is unknown can still be failed
+    let begin = begin_send(&mut party, default_send_expiration());
+    assert!(party.fail_transfers_single(begin.batch_transfer_idx.unwrap()));
+}
