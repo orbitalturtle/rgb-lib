@@ -2605,11 +2605,15 @@ pub trait WalletOffline: WalletBackup {
         let info_contents: InfoBatchTransfer =
             serde_json::from_str(&serialized_info).map_err(InternalError::from)?;
 
-        let fascia_path = transfer_dir.join(FASCIA_FILE);
-        let fascia_str = fs::read_to_string(fascia_path)?;
-        let fascia: Fascia = serde_json::from_str(&fascia_str).map_err(InternalError::from)?;
+        let fascia = self.read_transfer_fascia(&transfer_dir)?;
 
         Ok((txid, transfer_dir, info_contents, fascia))
+    }
+
+    fn read_transfer_fascia(&self, transfer_dir: &Path) -> Result<Fascia, Error> {
+        let fascia_path = transfer_dir.join(FASCIA_FILE);
+        let fascia_str = fs::read_to_string(fascia_path)?;
+        Ok(serde_json::from_str(&fascia_str).map_err(InternalError::from)?)
     }
 
     fn get_send_consignment_path_impl<P: AsRef<Path>>(&self, asset_transfer_dir: P) -> PathBuf {

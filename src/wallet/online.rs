@@ -1782,9 +1782,7 @@ pub trait WalletOnline: WalletOffline {
         let transfer_dir = self.get_transfers_dir().join(txid);
         let signed_psbt = self.get_signed_psbt(&transfer_dir)?;
         let mut runtime = self.rgb_runtime()?;
-        let fascia_path = transfer_dir.join(FASCIA_FILE);
-        let fascia_str = fs::read_to_string(fascia_path)?;
-        let fascia: Fascia = serde_json::from_str(&fascia_str).map_err(InternalError::from)?;
+        let fascia = self.read_transfer_fascia(&transfer_dir)?;
         self.broadcast_and_update_rgb(txn, &mut runtime, &signed_psbt, fascia)?;
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
