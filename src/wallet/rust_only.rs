@@ -420,6 +420,55 @@ impl Wallet {
     /// (i.e. after a `*_begin` call and before the matching `*_end` call) with a
     /// `min_confirmations` of at least 1.
     ///
+    /// This is useful when a transaction may not confirm for reasons outside of the wallet's
+    /// control, e.g. when it is co-signed or broadcast by a counterparty, as in on-chain swaps or
+    /// HTLC claims, so that a transaction that never confirms doesn't need to be undone.
+    ///
+    /// While the transfer waits for confirmations:
+    /// - its inputs stay reserved and its RGB change cannot be spent, as for any unsettled transfer;
+    /// - its RGB state change isn't in the RGB runtime yet, so the runtime doesn't know about the
+    ///   new allocations nor about the spending of the old ones;
+    /// - [`fail_transfers`](crate::wallet::RgbWalletOpsOnline::fail_transfers) won't fail it once
+    ///   its TX has been broadcast.
+    ///
+    /// The fascia is applied by [`refresh`](crate::wallet::RgbWalletOpsOnline::refresh), so the
+    /// wallet needs to be refreshed after the TX confirms, as usual.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use std::collections::HashMap;
+    ///
+    /// use rgb_lib::Error;
+    /// use rgb_lib::wallet::{Online, Recipient, RgbWalletOpsOnline, Wallet};
+    ///
+    /// fn send_applying_when_final(
+    ///     wallet: &mut Wallet,
+    ///     online: Online,
+    ///     recipient_map: HashMap<String, Vec<Recipient>>,
+    ///     expiration_timestamp: u64,
+    /// ) -> Result<String, Error> {
+    ///     // begin the send as usual, requiring at least 1 confirmation
+    ///     let begin = wallet.send_begin(
+    ///         online,
+    ///         recipient_map,
+    ///         false, // donation
+    ///         2,     // fee rate
+    ///         1,     // min confirmations
+    ///         expiration_timestamp,
+    ///         false, // dry run
+    ///     )?;
+    ///     // mark the batch transfer before ending the send
+    ///     wallet.set_apply_when_final(begin.batch_transfer_idx.unwrap())?;
+    ///     // sign and end the send as usual
+    ///     let signed_psbt = wallet.sign_psbt(begin.psbt, None)?;
+    ///     let txid = wallet.send_end(online, signed_psbt)?.txid;
+    ///     // later refreshes broadcast the TX once the recipient ACKs and, once it reaches
+    ///     // min_confirmations, apply its RGB state and settle the transfer
+    ///     wallet.refresh(online, None, vec![], false)?;
+    ///     Ok(txid)
+    /// }
+    /// ```
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     #[cfg(any(feature = "electrum", feature = "esplora"))]
