@@ -793,3 +793,32 @@ fn ifa_reject_list() {
     );
     assert!(allocations.contains(&Assignment::Fungible(inflation_amount)));
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn apply_when_final_refused() {
+    initialize();
+
+    let mut party = get_funded_party!();
+
+    let asset = party.issue_asset_ifa(Some(&[AMOUNT]), Some(&[AMOUNT]), None);
+    party.create_utxos_default();
+    let res = party
+        .wallet
+        .inflate_begin(
+            party.online,
+            asset.asset_id.clone(),
+            vec![1],
+            FEE_RATE,
+            MIN_CONFIRMATIONS,
+            false,
+        )
+        .unwrap();
+    assert_matches!(
+        party
+            .wallet
+            .set_apply_when_final(res.batch_transfer_idx.unwrap()),
+        Err(Error::Internal { details }) if details.ends_with("it is not a plain transfer")
+    );
+}

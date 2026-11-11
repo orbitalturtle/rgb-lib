@@ -16,6 +16,12 @@ const MIN_FEE_RATE: u64 = 1;
 pub(crate) const UTXO_SIZE: u32 = 1000;
 pub(crate) const UTXO_NUM: u8 = 5;
 
+/// Confirmations a TX conflicting with an outgoing transfer applying its RGB state only once final
+/// needs before the transfer is failed as lost, whatever its `min_confirmations`: failing is
+/// final, so a short reorg must not be able to revive the TX afterwards (e.g. in an HTLC, where
+/// a claim and a refund race for the same lock)
+pub(crate) const LOST_TX_MIN_CONFIRMATIONS: u8 = 6;
+
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
@@ -640,6 +646,133 @@ pub trait WalletOnline: WalletOffline {
         let tx = self.broadcast_signed_tx(txn, signed_tx)?;
         stock.consume_fascia(fascia, None)?;
         Ok(tx)
+    }
+
+    /// Apply the RGB fascia of an outgoing batch transfer whose application was deferred until its
+    /// transaction became final.
+    fn apply_deferred_fascia(
+        &self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<(), Error> {
+        let txid = batch_transfer
+            .txid
+            .as_ref()
+            .expect("batch transfer should have a TXID");
+        let transfer_dir = self.get_transfers_dir().join(txid);
+        let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
+        if fascia.witness_id().to_string() != *txid {
+            return Err(Error::Inconsistency {
+                details: format!("fascia of transfer {txid} commits to a different TX"),
+            });
+        }
+        debug!(self.logger(), "Applying deferred RGB fascia for TX {txid}");
+        self.rgb_stock(txn)?.consume_fascia(fascia, None)?;
+        Ok(())
+    }
+
+    /// Mark an outgoing batch transfer to apply its RGB state only once its TX is final.
+    ///
+    /// Its TX is still broadcast as usual, but its RGB fascia stays in its transfer directory and
+    /// refresh applies it only once the TX reaches the batch transfer's `min_confirmations`, so a TX
+    /// that never confirms leaves no trace in the RGB state. This is meant for TXs that may not
+    /// confirm for reasons outside of the wallet's control, e.g. co-signed or broadcast by a
+    /// counterparty, as in on-chain swaps or HTLC claims and refunds. Until then its inputs stay
+    /// reserved and its RGB change can't be spent, and refresh fails it once another TX spending
+    /// one of its inputs has `min_confirmations`.
+    ///
+    /// The batch transfer must be outgoing, in [`TransferStatus::Initiated`] status, require at
+    /// least 1 confirmation and only move existing assets (no mint, inflation, burn or link), as
+    /// those flows act on the RGB state change at their `*_end`. Marking it again does nothing.
+    fn set_apply_when_final_in_txn(
+        &self,
+        txn: &DbTxn,
+        batch_transfer_idx: i32,
+    ) -> Result<DbBatchTransfer, Error> {
+        let batch_transfer =
+            txn.get_batch_transfer(batch_transfer_idx)?
+                .ok_or(Error::BatchTransferNotFound {
+                    idx: batch_transfer_idx,
+                })?;
+        let refuse = |details: &str| Error::Internal {
+            details: format!(
+                "batch transfer {batch_transfer_idx} cannot apply its RGB state only once final: \
+                 {details}"
+            ),
+        };
+        if batch_transfer.incoming {
+            return Err(refuse("it is incoming"));
+        }
+        if batch_transfer.status != TransferStatus::Initiated {
+            return Err(refuse("it is not in Initiated status"));
+        }
+        if batch_transfer.min_confirmations == 0 {
+            return Err(refuse("it requires no confirmations"));
+        }
+        // only plain transfers: a mint relies on its fascia being applied at broadcast (lock
+        // checks, mint_end) and an inflation updates the known circulating supply at its *_end
+        if txn.iter_asset_transfers()?.iter().any(|at| {
+            at.batch_transfer_idx == batch_transfer_idx
+                && at.transition_type != Some(TypeOfTransition::Transfer)
+        }) {
+            return Err(refuse("it is not a plain transfer"));
+        }
+        if batch_transfer.apply_when_final {
+            return Ok(batch_transfer);
+        }
+        debug!(
+            self.logger(),
+            "Batch transfer {batch_transfer_idx} applies its RGB state only once final"
+        );
+        let mut updated: DbBatchTransferActMod = batch_transfer.into();
+        updated.apply_when_final = ActiveValue::Set(true);
+        txn.update_batch_transfer(&mut updated)
+    }
+
+    /// Undo what was recorded when broadcasting the TX of an outgoing transfer applying its RGB
+    /// state only once final, now that the TX has lost to a conflicting one: the inputs it didn't
+    /// actually spend are unspent again, its outputs will never exist and BDK no longer considers
+    /// it, so that a later sync can't bring its outputs back (e.g. when the conflicting TX spends
+    /// a counterparty's input, which BDK doesn't track).
+    fn revert_lost_deferred_tx(
+        &mut self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<(), Error> {
+        let txid = batch_transfer
+            .txid
+            .clone()
+            .expect("batch transfer should have a TXID");
+        let psbt_str = fs::read_to_string(self.get_transfer_dir(&txid).join(UNSIGNED_PSBT_FILE))?;
+        let tx = Psbt::from_str(&psbt_str)?.unsigned_tx;
+        for input in &tx.input {
+            if let Some(db_txo) = txn.get_txo(&Outpoint::from(input.previous_output))?
+                && db_txo.spent
+                && !self
+                    .indexer()
+                    .output_spent_on_chain(&input.previous_output)?
+            {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.spent = ActiveValue::Set(false);
+                txn.update_txo(db_txo)?;
+            }
+        }
+        for vout in 0..tx.output.len() as u32 {
+            let outpoint = Outpoint {
+                txid: txid.clone(),
+                vout,
+            };
+            if let Some(db_txo) = txn.get_txo(&outpoint)?
+                && db_txo.exists
+            {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.exists = ActiveValue::Set(false);
+                txn.update_txo(db_txo)?;
+            }
+        }
+        self.bdk_wallet_mut()
+            .apply_evicted_txs([(tx.compute_txid(), now().unix_timestamp() as u64)]);
+        self.flush_bdk_pending()
     }
 
     fn create_split_tx(
@@ -1507,6 +1640,71 @@ pub trait WalletOnline: WalletOffline {
                     .iter()
                     .any(|i| inputs.contains(&i.previous_output))
         }))
+    }
+
+    /// Whether one of the inputs of the TX of an outgoing transfer applying its RGB state only once
+    /// final has been spent by another confirmed TX, so that the TX can never confirm. To be called
+    /// while the TX is unknown to the indexer.
+    ///
+    /// The inputs are read from the unsigned PSBT, as the TX may be signed outside of the wallet,
+    /// and checked with the indexer, as they may not be the wallet's (e.g. a counterparty's or an
+    /// HTLC lock) and the conflicting TX may not involve the wallet at all.
+    fn deferred_tx_inputs_spent_elsewhere(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<bool, Error> {
+        let Some(txid) = &batch_transfer.txid else {
+            return Ok(false);
+        };
+        let psbt_str = fs::read_to_string(self.get_transfer_dir(txid).join(UNSIGNED_PSBT_FILE))?;
+        let psbt = Psbt::from_str(&psbt_str)?;
+        for input in &psbt.unsigned_tx.input {
+            if self
+                .indexer()
+                .output_spent_on_chain(&input.previous_output)?
+            {
+                // the spending TX may be this one, if it got mined since the indexer was last
+                // asked about it
+                return Ok(self.indexer().get_tx_confirmations(txid)?.is_none());
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the TX of an outgoing transfer applying its RGB state only once final has lost to a
+    /// conflicting TX that is final, i.e. that has been spending one of its inputs for at least the
+    /// batch transfer's `min_confirmations` and [`LOST_TX_MIN_CONFIRMATIONS`], so that a short
+    /// reorg can't revive the TX after the transfer has been failed. To be called while the TX is
+    /// unknown to the indexer.
+    ///
+    /// The indexer can't always tell which TX spent an input, so the height at which a conflicting
+    /// spend was first seen is saved and the depth counted from there. It is cleared if the spend
+    /// disappears (e.g. reorged out).
+    fn deferred_tx_conflict_final(
+        &self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<bool, Error> {
+        if !self.deferred_tx_inputs_spent_elsewhere(batch_transfer)? {
+            if batch_transfer.conflict_height.is_some() {
+                let mut updated: DbBatchTransferActMod = batch_transfer.clone().into();
+                updated.conflict_height = ActiveValue::Set(None);
+                txn.update_batch_transfer(&mut updated)?;
+            }
+            return Ok(false);
+        }
+        let tip = i64::from(self.indexer().get_latest_block_height()?);
+        let seen = match batch_transfer.conflict_height {
+            Some(seen) => seen,
+            None => {
+                let mut updated: DbBatchTransferActMod = batch_transfer.clone().into();
+                updated.conflict_height = ActiveValue::Set(Some(tip));
+                txn.update_batch_transfer(&mut updated)?;
+                tip
+            }
+        };
+        let required = std::cmp::max(batch_transfer.min_confirmations, LOST_TX_MIN_CONFIRMATIONS);
+        Ok(tip - seen + 1 >= i64::from(required))
     }
 
     /// Whether one of the inputs of the TX of the mint received by the given transfer has been
@@ -4169,7 +4367,8 @@ pub trait WalletOnline: WalletOffline {
     }
 
     /// Broadcast the TX of an outgoing batch transfer (a no-op on the network if a recipient
-    /// already did), update the RGB state and move the transfer to `WaitingConfirmations`.
+    /// already did), update the RGB state (unless the transfer applies it only once final) and
+    /// move the transfer to `WaitingConfirmations`.
     fn broadcast_batch(
         &mut self,
         txn: &DbTxn,
@@ -4181,9 +4380,14 @@ pub trait WalletOnline: WalletOffline {
             .expect("batch transfer should have a TXID");
         let transfer_dir = self.get_transfers_dir().join(txid);
         let signed_tx = self.get_signed_tx(&transfer_dir)?;
-        let mut stock = self.rgb_stock(txn)?;
-        let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
-        self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
+        if batch_transfer.apply_when_final {
+            // its fascia stays in the transfer directory until the TX is final
+            self.broadcast_signed_tx(txn, signed_tx)?;
+        } else {
+            let mut stock = self.rgb_stock(txn)?;
+            let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
+            self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
+        }
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
         updated_batch_transfer.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
 
@@ -4420,9 +4624,35 @@ pub trait WalletOnline: WalletOffline {
             }
         }
 
+        // an outgoing transfer applying its RGB state only once final whose TX can no longer
+        // confirm, as one of its inputs has been spent by another confirmed TX, is failed: its
+        // fascia was never applied, so there is no RGB state to roll back
+        if confirmations.is_none()
+            && !incoming
+            && batch_transfer.apply_when_final
+            && self.deferred_tx_conflict_final(txn, batch_transfer)?
+        {
+            info!(
+                self.logger(),
+                "An input of the TX has been spent by another final transaction, failing the transfer"
+            );
+            // fail first: reverting evicts the TX from BDK, which the DB transaction can't undo
+            let failed = self.fail_batch_transfer(txn, batch_transfer)?;
+            self.revert_lost_deferred_tx(txn, batch_transfer)?;
+            return Ok(Some(failed));
+        }
+
         let Some(confirmations) = confirmations else {
             return Ok(None);
         };
+
+        // the TX is known (again, e.g. after a reorg): a conflicting spend seen before no longer
+        // counts, so that a new one is measured from when it's seen
+        if batch_transfer.conflict_height.is_some() {
+            let mut updated: DbBatchTransferActMod = batch_transfer.clone().into();
+            updated.conflict_height = ActiveValue::Set(None);
+            txn.update_batch_transfer(&mut updated)?;
+        }
 
         if confirmations < batch_transfer.min_confirmations as u64 {
             if batch_transfer.status == TransferStatus::WaitingBroadcast {
@@ -4497,6 +4727,8 @@ pub trait WalletOnline: WalletOffline {
                 }
                 AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa | AssetSchema::Bfa => {}
             }
+        } else if batch_transfer.apply_when_final {
+            self.apply_deferred_fascia(txn, batch_transfer)?;
         }
 
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
@@ -6915,10 +7147,18 @@ pub trait WalletOnline: WalletOffline {
         consignment_hashes: &HashMap<String, String>,
         fascia: Fascia,
         sync_tte_used: bool,
+        apply_when_final: bool,
     ) -> Result<i32, Error> {
-        let mut stock = self.rgb_stock(txn)?;
         let signed_tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
-        self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
+        if apply_when_final {
+            // the fascia applied once the TX is final is the one built here, e.g. carrying the
+            // signed TX of a donation, as when it's applied right away
+            write_fascia(&self.get_transfer_dir(&txid).join(FASCIA_FILE), &fascia)?;
+            self.broadcast_signed_tx(txn, signed_tx)?;
+        } else {
+            let mut stock = self.rgb_stock(txn)?;
+            self.broadcast_and_update_rgb(txn, &mut stock, signed_tx, fascia)?;
+        }
         self.update_or_save_transfers(
             txn,
             txid,
@@ -7396,6 +7636,11 @@ pub trait WalletOnline: WalletOffline {
 
         let sync_tte_used = true;
         let batch_transfer_idx = if info_contents.donation {
+            let apply_when_final = txn
+                .get_batch_transfers_by_txid(&txid)?
+                .into_iter()
+                .find(|batch_transfer| !batch_transfer.incoming)
+                .is_some_and(|batch_transfer| batch_transfer.apply_when_final);
             self.finalize_transfer_end(
                 txn,
                 txid.clone(),
@@ -7405,6 +7650,7 @@ pub trait WalletOnline: WalletOffline {
                 &consignment_hashes,
                 fascia,
                 sync_tte_used,
+                apply_when_final,
             )?
         } else {
             let batch_transfer_idx = self.update_or_save_transfers(
@@ -7671,6 +7917,7 @@ pub trait WalletOnline: WalletOffline {
             &HashMap::new(),
             fascia,
             false,
+            false,
         )?;
 
         let (asset_id, transfer_info) = info_contents.transfers.into_iter().next().unwrap();
@@ -7803,6 +8050,7 @@ pub trait WalletOnline: WalletOffline {
             TransferStatus::WaitingConfirmations,
             &consignment_hashes,
             fascia,
+            false,
             false,
         )?;
 
@@ -8369,6 +8617,7 @@ pub trait WalletOnline: WalletOffline {
             &consignment_hashes,
             fascia,
             false,
+            false,
         )?;
 
         Ok(OperationResult {
@@ -8594,6 +8843,8 @@ mod tests {
             operation_secret_key: None,
             broadcast_deadline,
             retention_deadline: None,
+            apply_when_final: false,
+            conflict_height: None,
         }
     }
 
