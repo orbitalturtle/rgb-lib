@@ -729,6 +729,106 @@ pub trait WalletOnline: WalletOffline {
         txn.update_batch_transfer(&mut updated)
     }
 
+    /// Hand off a batch transfer applying its RGB state only once final whose TX is signed or
+    /// broadcast outside of the wallet's transfer flow (e.g. by a counterparty), instead of with
+    /// the matching `*_end` call.
+    ///
+    /// It moves from [`TransferStatus::Initiated`] to [`TransferStatus::WaitingConfirmations`]:
+    /// refresh then waits for its TX like for a transfer the wallet broadcast, and
+    /// `fail_transfers` can no longer fail it, as signed copies of its TX may exist outside the
+    /// wallet. Handing it off again does nothing.
+    ///
+    /// The transfer directory must hold the files saved by
+    /// [`save_deferred_transfer_files`](Self::save_deferred_transfer_files) (a `*_begin` call
+    /// saves them too).
+    fn hand_off_deferred_transfer(
+        &self,
+        txn: &DbTxn,
+        batch_transfer_idx: i32,
+    ) -> Result<DbBatchTransfer, Error> {
+        let batch_transfer =
+            txn.get_batch_transfer(batch_transfer_idx)?
+                .ok_or(Error::BatchTransferNotFound {
+                    idx: batch_transfer_idx,
+                })?;
+        if !batch_transfer.apply_when_final || batch_transfer.incoming {
+            return Err(Error::Internal {
+                details: format!(
+                    "batch transfer {batch_transfer_idx} cannot be handed off: it doesn't apply \
+                     its RGB state only once final"
+                ),
+            });
+        }
+        match batch_transfer.status {
+            TransferStatus::WaitingConfirmations => Ok(batch_transfer),
+            TransferStatus::Initiated => {
+                // refresh needs these files to settle or fail the transfer, which can't be failed
+                // once handed off: refuse to hand it off without them
+                let txid = batch_transfer.txid.clone().unwrap_or_default();
+                let transfer_dir = self.get_transfer_dir(&txid);
+                let psbt_str = fs::read_to_string(transfer_dir.join(UNSIGNED_PSBT_FILE))?;
+                let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
+                if Psbt::from_str(&psbt_str)?
+                    .unsigned_tx
+                    .compute_txid()
+                    .to_string()
+                    != txid
+                    || fascia.witness_id().to_string() != txid
+                {
+                    return Err(Error::Internal {
+                        details: format!(
+                            "batch transfer {batch_transfer_idx} cannot be handed off: its saved \
+                             files don't match its TX"
+                        ),
+                    });
+                }
+                debug!(
+                    self.logger(),
+                    "Handing off batch transfer {batch_transfer_idx}"
+                );
+                let mut updated: DbBatchTransferActMod = batch_transfer.into();
+                updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+                txn.update_batch_transfer(&mut updated)
+            }
+            status => Err(Error::Internal {
+                details: format!(
+                    "batch transfer {batch_transfer_idx} cannot be handed off in status {status:?}"
+                ),
+            }),
+        }
+    }
+
+    /// Save the files refresh needs to settle a transfer applying its RGB state only once final
+    /// whose TX hasn't been prepared by a `*_begin` call: its unsigned PSBT, whose inputs are
+    /// checked for conflicting spends, and its fascia, applied once the TX is final.
+    fn save_deferred_transfer_files(&self, psbt: &Psbt, fascia: &Fascia) -> Result<(), Error> {
+        // with a non-SegWit input the TXID changes at signing, so refresh couldn't find the TX
+        if psbt.inputs.iter().any(|input| {
+            input.redeem_script.is_some()
+                || !input
+                    .witness_utxo
+                    .as_ref()
+                    .is_some_and(|utxo| utxo.script_pubkey.is_witness_program())
+        }) {
+            return Err(Error::Internal {
+                details: s!("deferred transfer inputs must be native SegWit"),
+            });
+        }
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        if fascia.witness_id().to_string() != txid {
+            return Err(Error::Internal {
+                details: format!("fascia doesn't commit to TX {txid}"),
+            });
+        }
+        let transfer_dir = self.get_transfer_dir(&txid);
+        fs::create_dir_all(&transfer_dir)?;
+        atomic_write(
+            &transfer_dir.join(UNSIGNED_PSBT_FILE),
+            psbt.to_string().as_bytes(),
+        )?;
+        write_fascia(&transfer_dir.join(FASCIA_FILE), fascia)
+    }
+
     /// Undo what was recorded when broadcasting the TX of an outgoing transfer applying its RGB
     /// state only once final, now that the TX has lost to a conflicting one: the inputs it didn't
     /// actually spend are unspent again, its outputs will never exist and BDK no longer considers
@@ -773,6 +873,30 @@ pub trait WalletOnline: WalletOffline {
         self.bdk_wallet_mut()
             .apply_evicted_txs([(tx.compute_txid(), now().unix_timestamp() as u64)]);
         self.flush_bdk_pending()
+    }
+
+    /// Release the inputs of a transfer applying its RGB state only once final when it settles.
+    ///
+    /// A TX broadcast by the wallet released them at broadcast already, while one broadcast outside
+    /// of it (e.g. by a counterparty, after the transfer was handed off) still reserves them.
+    fn release_deferred_inputs(
+        &self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<(), Error> {
+        let txid = batch_transfer
+            .txid
+            .as_ref()
+            .expect("batch transfer should have a TXID");
+        let psbt_str = fs::read_to_string(self.get_transfer_dir(txid).join(UNSIGNED_PSBT_FILE))?;
+        for input in &Psbt::from_str(&psbt_str)?.unsigned_tx.input {
+            if let Some(db_txo) = txn.get_txo(&Outpoint::from(input.previous_output))? {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.spent = ActiveValue::Set(true);
+                txn.update_txo(db_txo)?;
+            }
+        }
+        txn.del_reserved_txos_for_batch_transfer(batch_transfer.idx)
     }
 
     fn create_split_tx(
@@ -4729,6 +4853,7 @@ pub trait WalletOnline: WalletOffline {
             }
         } else if batch_transfer.apply_when_final {
             self.apply_deferred_fascia(txn, batch_transfer)?;
+            self.release_deferred_inputs(txn, batch_transfer)?;
         }
 
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();

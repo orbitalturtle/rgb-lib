@@ -7,6 +7,17 @@ impl Wallet {
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)
     }
+
+    pub(crate) fn hand_off_deferred_transfer_for_test(
+        &mut self,
+        batch_transfer_idx: i32,
+    ) -> Result<DbBatchTransfer, Error> {
+        let txn = self.database().begin_transaction()?;
+        let batch_transfer = self.hand_off_deferred_transfer(&txn, batch_transfer_idx)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        Ok(batch_transfer)
+    }
 }
 
 /// Number of outputs of the TX of `psbt` hosting an allocation of `asset_id` in the RGB runtime,
@@ -448,4 +459,112 @@ fn fail() {
             .set_apply_when_final(begin.batch_transfer_idx.unwrap()),
         Err(Error::Internal { details: _ })
     ));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn handed_off() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = recipient_map(&asset.asset_id, &receive_data, amount);
+    let begin = party.send_begin_result(&recipient_map).unwrap();
+    let batch_transfer_idx = begin.batch_transfer_idx.unwrap();
+    let txid = Psbt::from_str(&begin.psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+
+    // only a transfer applying its RGB state once final can be handed off
+    assert_matches!(
+        party
+            .wallet
+            .hand_off_deferred_transfer_for_test(batch_transfer_idx),
+        Err(Error::Internal { details: _ })
+    );
+    party
+        .wallet
+        .set_apply_when_final(batch_transfer_idx)
+        .unwrap();
+
+    // a flow whose TX isn't prepared by a *_begin call saves the files refresh needs itself, the
+    // fascia committing to the TX of the PSBT
+    let transfer_dir = party.wallet.get_transfer_dir(&txid);
+    let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE)).unwrap();
+    let psbt = Psbt::from_str(&begin.psbt).unwrap();
+    fs::remove_file(transfer_dir.join(UNSIGNED_PSBT_FILE)).unwrap();
+    let mut other_psbt = psbt.clone();
+    other_psbt.unsigned_tx.lock_time =
+        bdk_wallet::bitcoin::absolute::LockTime::from_height(1).unwrap();
+    assert_matches!(
+        party
+            .wallet
+            .save_deferred_transfer_files(&other_psbt, &fascia),
+        Err(Error::Internal { details: _ })
+    );
+    party
+        .wallet
+        .save_deferred_transfer_files(&psbt, &fascia)
+        .unwrap();
+    assert!(transfer_dir.join(UNSIGNED_PSBT_FILE).exists());
+
+    // once handed off (twice: it's idempotent) it waits for confirmations and can't be failed
+    for _ in 0..2 {
+        let batch_transfer = party
+            .wallet
+            .hand_off_deferred_transfer_for_test(batch_transfer_idx)
+            .unwrap();
+        assert_eq!(batch_transfer.status, TransferStatus::WaitingConfirmations);
+    }
+    assert!(matches!(
+        party
+            .wallet
+            .fail_transfers(party.online, Some(batch_transfer_idx), false, false),
+        Err(Error::CannotFailBatchTransfer)
+    ));
+
+    // the TX is signed and broadcast outside of the transfer flow, its RGB state left untouched
+    // and its inputs reserved until it is final
+    let signed_psbt = party.wallet.sign_psbt(begin.psbt.clone(), None).unwrap();
+    let tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+    let guard = stop_mining();
+    party.wallet.broadcast_tx(tx).unwrap();
+    party
+        .wallet
+        .refresh(party.online, None, vec![], false)
+        .unwrap();
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+    assert_eq!(
+        rgb_allocated_outputs(&party, &asset.asset_id, &begin.psbt),
+        0
+    );
+    let reserved = |party: &SinglesigParty| {
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        let reserved = txn
+            .iter_reserved_txos()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.reserved_for_colored == Some(batch_transfer_idx))
+            .count();
+        txn.commit().unwrap();
+        reserved
+    };
+    assert!(reserved(&party) > 0);
+
+    // once final its RGB state is applied, the transfer settles and its inputs are released
+    drop(guard);
+    mine(false);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert!(rgb_allocated_outputs(&party, &asset.asset_id, &begin.psbt) > 0);
+    assert_eq!(reserved(&party), 0);
 }
