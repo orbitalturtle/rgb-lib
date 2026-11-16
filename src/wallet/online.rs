@@ -1035,6 +1035,18 @@ pub trait WalletOnline: WalletOffline {
         clean_ack_outcome(res.error)
     }
 
+    /// Whether the batch transfer is in [`TransferStatus::Initiated`] status but its TX is already
+    /// known to the indexer (e.g. it was broadcast without calling the matching `*_end`).
+    fn initiated_tx_known(&self, batch_transfer: &DbBatchTransfer) -> Result<bool, Error> {
+        if batch_transfer.status != TransferStatus::Initiated {
+            return Ok(false);
+        }
+        let Some(txid) = &batch_transfer.txid else {
+            return Ok(false);
+        };
+        Ok(self.indexer().get_tx_confirmations(txid)?.is_some())
+    }
+
     fn try_fail_batch_transfer(
         &mut self,
         txn: &DbTxn,
@@ -1111,6 +1123,17 @@ pub trait WalletOnline: WalletOffline {
                 .is_some()
         {
             return Ok(TryFailBatchTransferOutcome::Refreshed);
+        }
+        // an outgoing transfer still Initiated whose TX is already known to the indexer has been
+        // broadcast without the matching *_end (e.g. by a counterparty in a two-party flow): it
+        // may still confirm, so failing it would release UTXOs that are already spent and drop
+        // RGB state that may become final
+        if !batch_transfer.incoming && self.initiated_tx_known(batch_transfer)? {
+            info!(
+                self.logger(),
+                "TX of an Initiated transfer known to the indexer, fail denied"
+            );
+            return Ok(TryFailBatchTransferOutcome::Denied);
         }
         // an outgoing transfer every recipient ACKed has had its TX released: if it's still waiting
         // for the counterparty (e.g. its TX is not broadcast as an invoice has expired) it can only
@@ -8420,6 +8443,8 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
     /// obtained the TX before the data loss broadcasting it later, which would spend the inputs of
     /// the failed transfer. Ruling that out requires invalidating the TX by spending one of its
     /// inputs, which this method does not do.
+    /// A transfer in status [`TransferStatus::Initiated`] whose TX is already known to the indexer
+    /// (i.e. it has been broadcast) is never failed, since the TX may still confirm.
     fn fail_transfers(
         &mut self,
         online: Online,
