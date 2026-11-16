@@ -26,6 +26,8 @@ pub struct Model {
     pub operation_secret_key: Option<Vec<u8>>,
     pub broadcast_deadline: Option<i64>,
     pub retention_deadline: Option<i64>,
+    pub apply_when_final: bool,
+    pub conflict_height: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -41,6 +43,8 @@ pub enum Column {
     OperationSecretKey,
     BroadcastDeadline,
     RetentionDeadline,
+    ApplyWhenFinal,
+    ConflictHeight,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -76,6 +80,8 @@ impl ColumnTrait for Column {
             Self::OperationSecretKey => ColumnType::VarBinary(StringLen::None).def().null(),
             Self::BroadcastDeadline => ColumnType::BigInteger.def().null(),
             Self::RetentionDeadline => ColumnType::BigInteger.def().null(),
+            Self::ApplyWhenFinal => ColumnType::Boolean.def().default(false),
+            Self::ConflictHeight => ColumnType::BigInteger.def().null(),
         }
     }
 }

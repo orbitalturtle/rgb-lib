@@ -3447,3 +3447,25 @@ fn amounts_past_u64() {
         AMOUNT + 1
     );
 }
+
+// a mint relies on its fascia being applied at broadcast, so it cannot apply it only once final
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+#[serial(evm)]
+fn apply_when_final_refused() {
+    initialize();
+
+    let (_token_contract, bridge_contract) = deploy_token_and_bridge();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
+
+    let receive_data = rcv_party.blind_receive();
+    let res = party.mint_begin(party.online, &asset.asset_id, mint_recipient(&receive_data));
+    assert_matches!(
+        party.wallet.set_apply_when_final(res.batch_transfer_idx),
+        Err(Error::Internal { details }) if details.ends_with("it is not a plain transfer")
+    );
+}
