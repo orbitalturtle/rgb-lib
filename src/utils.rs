@@ -621,22 +621,205 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// make the PSBT too large to be parsed back (see [`check_psbt_parsable`]).
 #[cfg(feature = "wallet")]
 pub(crate) fn strip_rgb_data(psbt: &mut Psbt) {
-    let is_rgb = |key: &bdk_wallet::bitcoin::psbt::raw::ProprietaryKey| {
-        [
-            &PSBT_RGB_PREFIX[..],
-            &PSBT_MPC_PREFIX[..],
-            &PSBT_OPRET_PREFIX[..],
-            &PSBT_TAPRET_PREFIX[..],
-        ]
-        .contains(&key.prefix.as_slice())
-    };
-    psbt.proprietary.retain(|key, _| !is_rgb(key));
+    psbt.proprietary.retain(|key, _| !is_rgb_key(key));
     for input in &mut psbt.inputs {
-        input.proprietary.retain(|key, _| !is_rgb(key));
+        input.proprietary.retain(|key, _| !is_rgb_key(key));
     }
     for output in &mut psbt.outputs {
-        output.proprietary.retain(|key, _| !is_rgb(key));
+        output.proprietary.retain(|key, _| !is_rgb_key(key));
     }
+}
+
+/// Whether the given PSBT proprietary key holds RGB data (transitions, commitments or their
+/// hosts).
+#[cfg(feature = "wallet")]
+pub(crate) fn is_rgb_key(key: &bdk_wallet::bitcoin::psbt::raw::ProprietaryKey) -> bool {
+    [
+        &PSBT_RGB_PREFIX[..],
+        &PSBT_MPC_PREFIX[..],
+        &PSBT_OPRET_PREFIX[..],
+        &PSBT_TAPRET_PREFIX[..],
+    ]
+    .contains(&key.prefix.as_slice())
+}
+
+/// Maximum number of inputs, and of outputs, of a PSBT built outside of the wallet.
+#[cfg(feature = "_online")]
+const MAX_EXTERNAL_PSBT_IO: usize = 1000;
+
+#[cfg(feature = "_online")]
+fn invalid_coloring_info(details: impl Into<String>) -> Error {
+    Error::InvalidColoringInfo {
+        details: details.into(),
+    }
+}
+
+// used by the on-chain swap and HTLC flows built on top of them
+#[cfg(feature = "_online")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn input_set(psbt: &Psbt) -> HashSet<OutPoint> {
+    psbt.unsigned_tx
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect()
+}
+
+/// Check a PSBT built outside of the wallet before coloring it, and return a copy of it with the
+/// OP_RETURN output hosting the RGB commitment, plus whether that output is first (i.e. whether
+/// the PSBT has Taproot outputs). As in `color_psbt`, output indexes in the coloring info then
+/// exclude the OP_RETURN output and shift by one, whether the output was added here or was
+/// already in the PSBT.
+///
+/// The PSBT is refused when coloring it could commit to the wrong data or produce a TX that
+/// can't carry the commitment: when it is already (partially) signed, carries RGB data already,
+/// spends inputs other than P2WPKH, P2WSH or P2TR ones, has duplicate inputs or inconsistent
+/// input data, asks for a sighash type other than ALL (or DEFAULT on Taproot inputs), which would
+/// let its outputs, and so the commitment, change after signing, is too heavy to be relayed once
+/// the commitment is added or has an OP_RETURN output that can't host the commitment (with
+/// unrelated data, after a Taproot output or more than one). The input and output data of the
+/// PSBT are kept, and the PSBT itself is never modified.
+#[cfg(feature = "_online")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn prepare_external_psbt(psbt: &Psbt) -> Result<(Psbt, bool), Error> {
+    if psbt.inputs.is_empty() || psbt.outputs.is_empty() {
+        return Err(invalid_coloring_info("PSBT has no inputs or no outputs"));
+    }
+    if psbt.inputs.len() > MAX_EXTERNAL_PSBT_IO || psbt.outputs.len() > MAX_EXTERNAL_PSBT_IO {
+        return Err(invalid_coloring_info(format!(
+            "PSBT has more than {MAX_EXTERNAL_PSBT_IO} inputs or outputs"
+        )));
+    }
+    if psbt.inputs.len() != psbt.unsigned_tx.input.len()
+        || psbt.outputs.len() != psbt.unsigned_tx.output.len()
+    {
+        return Err(invalid_coloring_info(
+            "PSBT input or output maps don't match its TX",
+        ));
+    }
+    if input_set(psbt).len() != psbt.inputs.len() {
+        return Err(invalid_coloring_info("PSBT has duplicate inputs"));
+    }
+    if psbt.proprietary.keys().any(is_rgb_key)
+        || psbt
+            .outputs
+            .iter()
+            .any(|output| output.proprietary.keys().any(is_rgb_key))
+    {
+        return Err(invalid_coloring_info(
+            "PSBT already contains RGB commitments",
+        ));
+    }
+    for (index, (input, txin)) in psbt.inputs.iter().zip(&psbt.unsigned_tx.input).enumerate() {
+        if !input.partial_sigs.is_empty()
+            || input.tap_key_sig.is_some()
+            || !input.tap_script_sigs.is_empty()
+            || input.final_script_sig.is_some()
+            || input.final_script_witness.is_some()
+            || !txin.script_sig.is_empty()
+            || !txin.witness.is_empty()
+        {
+            return Err(invalid_coloring_info("cannot color an already signed PSBT"));
+        }
+        if input.proprietary.keys().any(is_rgb_key) {
+            return Err(invalid_coloring_info(
+                "PSBT input already contains RGB consumers",
+            ));
+        }
+        let witness = input.witness_utxo.as_ref().ok_or_else(|| {
+            invalid_coloring_info(format!("PSBT input {index} has no witness_utxo"))
+        })?;
+        let script = &witness.script_pubkey;
+        if !(script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr())
+            || input.redeem_script.is_some()
+        {
+            return Err(invalid_coloring_info(
+                "PSBT inputs must be P2WPKH, P2WSH or P2TR",
+            ));
+        }
+        // ALL (0x01) commits to every output, and so does DEFAULT (0x00), which only Taproot has
+        if input.sighash_type.is_some_and(|sighash_type| {
+            let sighash_type = sighash_type.to_u32();
+            sighash_type > 1 || (sighash_type == 0 && !script.is_p2tr())
+        }) {
+            return Err(invalid_coloring_info(
+                "PSBT inputs must be signed with sighash type ALL",
+            ));
+        }
+        if let Some(previous) = &input.non_witness_utxo
+            && (previous.compute_txid() != txin.previous_output.txid
+                || previous.output.get(txin.previous_output.vout as usize) != Some(witness))
+        {
+            return Err(invalid_coloring_info(
+                "PSBT previous output does not match witness_utxo",
+            ));
+        }
+    }
+    let mut working = psbt.clone();
+    let shift = working
+        .unsigned_tx
+        .output
+        .iter()
+        .any(|output| output.script_pubkey.is_p2tr());
+    let hosts: Vec<usize> = working
+        .unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| output.script_pubkey.is_op_return().then_some(index))
+        .collect();
+    match hosts.as_slice() {
+        [] => {
+            let host = TxOut {
+                value: BdkAmount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([]),
+            };
+            if shift {
+                working.unsigned_tx.output.insert(0, host);
+                working.outputs.insert(0, Default::default());
+            } else {
+                working.unsigned_tx.output.push(host);
+                working.outputs.push(Default::default());
+            }
+        }
+        [index] if !shift || *index == 0 => {
+            // an empty OP_RETURN or rgb-lib's own placeholder, sized for the commitment so that
+            // fee estimation accounts for it (see prepare_psbt)
+            let host = &working.unsigned_tx.output[*index];
+            if host.value != BdkAmount::ZERO
+                || (host.script_pubkey != ScriptBuf::new_op_return([])
+                    && host.script_pubkey != ScriptBuf::new_op_return([0; 32]))
+            {
+                return Err(invalid_coloring_info(
+                    "PSBT OP_RETURN contains unrelated data",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid_coloring_info(
+                "PSBT needs one OP_RETURN before Taproot outputs",
+            ));
+        }
+    }
+    // the weight without witnesses, with the 32-byte commitment the host gets once colored, is
+    // a lower bound: a TX over the limit can never be relayed
+    let commitment_weight = if working
+        .unsigned_tx
+        .output
+        .iter()
+        .any(|output| output.script_pubkey == ScriptBuf::new_op_return([]))
+    {
+        // the host's script grows from OP_RETURN to OP_RETURN OP_PUSHBYTES_32 <32 bytes>
+        33 * 4
+    } else {
+        0
+    };
+    if working.unsigned_tx.weight().to_wu() + commitment_weight
+        > u64::from(bdk_wallet::bitcoin::policy::MAX_STANDARD_TX_WEIGHT)
+    {
+        return Err(invalid_coloring_info("PSBT TX is too heavy to be relayed"));
+    }
+    Ok((working, shift))
 }
 
 /// Check that the given PSBT can be parsed back, which fails if its global map exceeds
@@ -1358,5 +1541,263 @@ mod tests {
             get_indexer_and_resolver(&IndexerConfig::Electrum { url }, BitcoinNetwork::Regtest);
         // Indexer is not Debug, so the Ok variant cannot be printed by assert_matches
         assert!(matches!(result, Err(Error::InvalidIndexer { .. })));
+    }
+
+    #[cfg(feature = "_online")]
+    mod external_psbt {
+        use super::*;
+        use bdk_wallet::bitcoin::{
+            Sequence, TxIn, Witness, absolute::LockTime, transaction::Version,
+        };
+        use serial_test::parallel;
+        fn unsigned() -> Psbt {
+            let script = ScriptBuf::from_bytes([vec![0x51, 0x20], vec![1; 32]].concat());
+            let mut psbt = Psbt::from_unsigned_tx(BdkTransaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_str(&"01".repeat(32)).unwrap(), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: BdkAmount::from_sat(9000),
+                    script_pubkey: script.clone(),
+                }],
+            })
+            .unwrap();
+            psbt.inputs[0].witness_utxo = Some(TxOut {
+                value: BdkAmount::from_sat(10000),
+                script_pubkey: script,
+            });
+            psbt
+        }
+
+        #[test]
+        #[parallel]
+        fn keeps_maps_and_never_mutates_on_error() {
+            let mut psbt = unsigned();
+            psbt.inputs[0].proprietary.insert(
+                bdk_wallet::bitcoin::psbt::raw::ProprietaryKey {
+                    prefix: b"application".to_vec(),
+                    subtype: 1,
+                    key: vec![2],
+                },
+                vec![3],
+            );
+            psbt.outputs[0].proprietary.insert(
+                bdk_wallet::bitcoin::psbt::raw::ProprietaryKey {
+                    prefix: b"application".to_vec(),
+                    subtype: 4,
+                    key: vec![5],
+                },
+                vec![6],
+            );
+            // sighash type ALL is accepted
+            psbt.inputs[0].sighash_type =
+                Some(bdk_wallet::bitcoin::psbt::PsbtSighashType::from_u32(0x01));
+            let before = psbt.clone();
+            let (prepared, shift) = prepare_external_psbt(&psbt).unwrap();
+            assert!(shift);
+            assert_eq!(psbt, before);
+            assert_eq!(prepared.inputs, before.inputs);
+            assert_eq!(prepared.outputs[1], before.outputs[0]);
+            assert_eq!(prepared.proprietary, before.proprietary);
+            assert!(prepared.unsigned_tx.output[0].script_pubkey.is_op_return());
+        }
+
+        #[test]
+        #[parallel]
+        fn shifts_taproot_outputs_after_existing_opreturn() {
+            let mut psbt = unsigned();
+            psbt.unsigned_tx.output.insert(
+                0,
+                TxOut {
+                    value: BdkAmount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                },
+            );
+            psbt.outputs.insert(0, Default::default());
+            let (prepared, shift) = prepare_external_psbt(&psbt).unwrap();
+            assert!(shift);
+            assert_eq!(prepared.unsigned_tx, psbt.unsigned_tx);
+        }
+
+        fn error(result: Result<(Psbt, bool), Error>) -> String {
+            match result {
+                Err(Error::InvalidColoringInfo { details }) => details,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        #[test]
+        #[parallel]
+        fn checks_input_types_and_sighash() {
+            let p2wpkh = ScriptBuf::from_bytes([vec![0x00, 0x14], vec![1; 20]].concat());
+            let sighash = |value| Some(bdk_wallet::bitcoin::psbt::PsbtSighashType::from_u32(value));
+            // a future witness version is not an input type that can be signed as expected
+            let mut psbt = unsigned();
+            psbt.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey =
+                ScriptBuf::from_bytes([vec![0x52, 0x20], vec![1; 32]].concat());
+            assert_eq!(
+                error(prepare_external_psbt(&psbt)),
+                "PSBT inputs must be P2WPKH, P2WSH or P2TR"
+            );
+            // DEFAULT (0x00) only exists for Taproot inputs
+            let mut psbt = unsigned();
+            psbt.inputs[0].sighash_type = sighash(0);
+            prepare_external_psbt(&psbt).unwrap();
+            psbt.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey = p2wpkh.clone();
+            assert_eq!(
+                error(prepare_external_psbt(&psbt)),
+                "PSBT inputs must be signed with sighash type ALL"
+            );
+            psbt.inputs[0].sighash_type = sighash(1);
+            prepare_external_psbt(&psbt).unwrap();
+        }
+
+        #[test]
+        #[parallel]
+        fn checks_the_opreturn_host() {
+            let with_host = |script: ScriptBuf, value| {
+                let mut psbt = unsigned();
+                psbt.unsigned_tx.output.insert(
+                    0,
+                    TxOut {
+                        value: BdkAmount::from_sat(value),
+                        script_pubkey: script,
+                    },
+                );
+                psbt.outputs.insert(0, Default::default());
+                psbt
+            };
+            // rgb-lib's placeholder, sized for the commitment, is a valid host
+            let (prepared, _) =
+                prepare_external_psbt(&with_host(ScriptBuf::new_op_return([0; 32]), 0)).unwrap();
+            assert_eq!(prepared.unsigned_tx.output.len(), 2);
+            // a host burning sats or carrying other data is not
+            for psbt in [
+                with_host(ScriptBuf::new_op_return([]), 1),
+                with_host(ScriptBuf::new_op_return([1; 32]), 0),
+            ] {
+                assert_eq!(
+                    error(prepare_external_psbt(&psbt)),
+                    "PSBT OP_RETURN contains unrelated data"
+                );
+            }
+        }
+
+        #[test]
+        #[parallel]
+        fn counts_the_commitment_in_the_weight() {
+            let max = u64::from(bdk_wallet::bitcoin::policy::MAX_STANDARD_TX_WEIGHT);
+            let padded = |len: usize| {
+                let mut psbt = unsigned();
+                psbt.unsigned_tx.output.push(TxOut {
+                    value: BdkAmount::from_sat(1000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51; len]),
+                });
+                psbt.outputs.push(Default::default());
+                psbt
+            };
+            // the longest padding keeping the TX, with an empty host added, within the limit
+            let weight = |len| {
+                let mut tx = padded(len).unsigned_tx;
+                tx.output.push(TxOut {
+                    value: BdkAmount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                });
+                tx.weight().to_wu()
+            };
+            let len = (90_000..100_000)
+                .rev()
+                .find(|len| weight(*len) <= max)
+                .unwrap();
+            // fits without the commitment, but not once the host holds it
+            assert!(weight(len) + 33 * 4 > max);
+            assert_eq!(
+                error(prepare_external_psbt(&padded(len))),
+                "PSBT TX is too heavy to be relayed"
+            );
+            // leaving room for the commitment is fine
+            prepare_external_psbt(&padded(len - 33)).unwrap();
+        }
+
+        #[test]
+        #[parallel]
+        fn rejects_unsafe_psbts() {
+            let base = unsigned();
+            for case in 0..8 {
+                let mut psbt = base.clone();
+                match case {
+                    0 => psbt.inputs[0].final_script_witness = Some(Witness::new()),
+                    1 => psbt.inputs[0].redeem_script = Some(ScriptBuf::new()),
+                    2 => psbt.inputs[0].witness_utxo = None,
+                    3 => {
+                        psbt.inputs.push(psbt.inputs[0].clone());
+                        psbt.unsigned_tx
+                            .input
+                            .push(psbt.unsigned_tx.input[0].clone());
+                    }
+                    4 => {
+                        psbt.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey =
+                            ScriptBuf::new();
+                    }
+                    5 => {
+                        psbt.inputs[0].proprietary.insert(
+                            bdk_wallet::bitcoin::psbt::raw::ProprietaryKey {
+                                prefix: b"RGB".to_vec(),
+                                subtype: 1,
+                                key: vec![],
+                            },
+                            vec![1],
+                        );
+                    }
+                    6 => {
+                        psbt.inputs[0].sighash_type =
+                            Some(bdk_wallet::bitcoin::psbt::PsbtSighashType::from_u32(0x02));
+                    }
+                    7 => {
+                        psbt.unsigned_tx.output.push(TxOut {
+                            value: BdkAmount::from_sat(1000),
+                            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 100_000]),
+                        });
+                        psbt.outputs.push(Default::default());
+                    }
+                    _ => unreachable!(),
+                }
+                let before = psbt.clone();
+                assert!(prepare_external_psbt(&psbt).is_err());
+                assert_eq!(psbt, before);
+            }
+        }
+
+        #[test]
+        #[parallel]
+        fn rejects_ambiguous_opreturn_hosts() {
+            for case in 0..3 {
+                let mut psbt = unsigned();
+                let script = if case == 0 {
+                    ScriptBuf::new_op_return([7])
+                } else {
+                    ScriptBuf::new_op_return([])
+                };
+                let host = TxOut {
+                    value: BdkAmount::ZERO,
+                    script_pubkey: script,
+                };
+                if case < 2 {
+                    psbt.unsigned_tx.output.push(host);
+                    psbt.outputs.push(Default::default());
+                } else {
+                    psbt.unsigned_tx.output.insert(0, host.clone());
+                    psbt.outputs.insert(0, Default::default());
+                    psbt.unsigned_tx.output.push(host);
+                    psbt.outputs.push(Default::default());
+                }
+                assert!(prepare_external_psbt(&psbt).is_err());
+            }
+        }
     }
 }
