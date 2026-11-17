@@ -557,11 +557,17 @@ fn color_psbt_overflow_fail() {
     // total amount in output_map overflows u64: two valid vouts whose amounts sum to
     // more than u64::MAX (the checked sum must error before reaching the available check)
     let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
+    // the funded UTXO only covers two outputs at the dust limit (330 sats)
+    let address_2 = BdkAddress::from_str(&recv_party.get_address()).unwrap();
     let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
     tx_builder
         .add_recipient(
             address.assume_checked().script_pubkey(),
-            BdkAmount::from_sat(amt_sat),
+            BdkAmount::from_sat(330),
+        )
+        .add_recipient(
+            address_2.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(330),
         )
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut psbt = tx_builder.finish().unwrap();
@@ -610,6 +616,144 @@ fn color_psbt_overflow_fail() {
     let result = party_send.wallet.color_psbt(&mut psbt, coloring_info);
     let msg = "vout in output_map is too large";
     assert!(matches!(result, Err(Error::InvalidColoringInfo { details: m }) if m == msg));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn color_psbt_burn_and_layout_fail() {
+    initialize();
+
+    let amt_sat = 500;
+
+    // wallets
+    let mut party_send = get_funded_noutxo_party!();
+    let mut recv_party = get_empty_party!();
+
+    // create 1 UTXO and send the rest
+    party_send.create_utxos(false, Some(1), None, FEE_RATE, None);
+    party_send.send_btc(&recv_party.get_address(), 99_998_200);
+
+    // issue 2 assets, both on the only UTXO
+    let asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
+    let other_asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
+
+    // prepare PSBT
+    let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
+    let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .add_recipient(
+            address.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(amt_sat),
+        )
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let base_psbt = tx_builder.finish().unwrap();
+    let vout = base_psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .position(|o| o.value.to_sat() == amt_sat)
+        .unwrap() as u32;
+    let coloring_info = |amounts: &[(&str, u64)]| ColoringInfo {
+        asset_info_map: amounts
+            .iter()
+            .map(|(asset_id, amount)| {
+                (
+                    ContractId::from_str(asset_id).unwrap(),
+                    AssetColoringInfo {
+                        output_map: HashMap::from([(vout, *amount)]),
+                        static_blinding: None,
+                    },
+                )
+            })
+            .collect(),
+        static_blinding: None,
+        nonce: None,
+    };
+    let details = |result: Result<(Fascia, AssetBeneficiariesMap), Error>| match result {
+        Err(Error::InvalidColoringInfo { details }) => details,
+        other => panic!("unexpected result: {other:?}"),
+    };
+
+    // an asset on the input left out of the coloring info would be burned
+    let mut psbt = base_psbt.clone();
+    let result = party_send
+        .wallet
+        .color_psbt(&mut psbt, coloring_info(&[(&asset.asset_id, AMOUNT)]));
+    let contract_id = ContractId::from_str(&other_asset.asset_id).unwrap();
+    assert_eq!(
+        details(result),
+        format!(
+            "inputs hold asset {contract_id}, missing from the coloring info, which would burn it"
+        )
+    );
+
+    // so would the part of an asset the output map doesn't reassign
+    let mut psbt = base_psbt.clone();
+    let result = party_send.wallet.color_psbt(
+        &mut psbt,
+        coloring_info(&[
+            (&asset.asset_id, AMOUNT - 1),
+            (&other_asset.asset_id, AMOUNT),
+        ]),
+    );
+    assert_eq!(
+        details(result),
+        format!(
+            "total amount in output_map ({}) less than available ({AMOUNT}), which would burn \
+             the rest",
+            AMOUNT - 1
+        )
+    );
+
+    // a refused PSBT is left as it was
+    let mut psbt = base_psbt.clone();
+    let mut bad_map = coloring_info(&[(&asset.asset_id, AMOUNT), (&other_asset.asset_id, AMOUNT)]);
+    for info in bad_map.asset_info_map.values_mut() {
+        info.output_map = HashMap::from([(psbt.unsigned_tx.output.len() as u32, AMOUNT)]);
+    }
+    let result = party_send.wallet.color_psbt(&mut psbt, bad_map);
+    assert_eq!(
+        details(result),
+        "invalid vout in output_map, does not exist in the given PSBT"
+    );
+    assert_eq!(psbt, base_psbt);
+
+    // with Taproot outputs the OP_RETURN output must come first, or the output indexes of the
+    // coloring info would point at the wrong outputs
+    let key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    let mut tx = base_psbt.unsigned_tx.clone();
+    tx.output.push(TxOut {
+        value: BdkAmount::from_sat(amt_sat),
+        script_pubkey: ScriptBuf::from_bytes(
+            [vec![0x51, 0x20], hex::decode(key).unwrap()].concat(),
+        ),
+    });
+    tx.output.push(TxOut {
+        value: BdkAmount::ZERO,
+        script_pubkey: ScriptBuf::new_op_return([]),
+    });
+    let taproot_psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    let mut psbt = taproot_psbt.clone();
+    let result = party_send.wallet.color_psbt(
+        &mut psbt,
+        coloring_info(&[(&asset.asset_id, AMOUNT), (&other_asset.asset_id, AMOUNT)]),
+    );
+    assert_eq!(
+        details(result),
+        "PSBT with Taproot outputs must have its OP_RETURN output first"
+    );
+    assert_eq!(psbt, taproot_psbt);
+
+    // coloring every asset in full works
+    let mut psbt = base_psbt.clone();
+    party_send
+        .wallet
+        .color_psbt(
+            &mut psbt,
+            coloring_info(&[(&asset.asset_id, AMOUNT), (&other_asset.asset_id, AMOUNT)]),
+        )
+        .unwrap();
 }
 
 #[cfg(feature = "electrum")]
