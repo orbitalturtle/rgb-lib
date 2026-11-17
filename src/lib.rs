@@ -555,7 +555,7 @@ use crate::utils::INDEXER_STOP_GAP;
 #[cfg(feature = "_online")]
 use crate::utils::write_fascia;
 #[cfg(feature = "wallet")]
-use crate::utils::{check_psbt_parsable, strip_rgb_data};
+use crate::utils::{check_full_allocation, check_output_map, check_psbt_parsable, strip_rgb_data};
 #[cfg(feature = "bitcoind")]
 use crate::wallet::BitcoindClient;
 #[cfg(feature = "_online")]

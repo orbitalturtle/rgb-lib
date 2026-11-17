@@ -68,11 +68,18 @@ impl Wallet {
             opreturn_first = true;
         }
 
-        if !transaction
+        let opreturn_position = transaction
             .output
             .iter()
-            .any(|o| o.script_pubkey.is_op_return())
-        {
+            .position(|o| o.script_pubkey.is_op_return());
+        // with Taproot outputs the output indexes of the coloring info skip a first OP_RETURN
+        // output, so one elsewhere would shift every seal to the wrong output
+        if opreturn_first && opreturn_position.is_some_and(|position| position != 0) {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("PSBT with Taproot outputs must have its OP_RETURN output first"),
+            });
+        }
+        if opreturn_position.is_none() {
             let opreturn_output = TxOut {
                 value: BdkAmount::ZERO,
                 script_pubkey: ScriptBuf::new_op_return([]),
@@ -82,6 +89,10 @@ impl Wallet {
             } else {
                 transaction.output.push(opreturn_output);
             }
+        }
+        // checked before touching the caller's PSBT, so that a refused one is left as it was
+        check_output_map(&transaction.output, &coloring_info, opreturn_first)?;
+        if opreturn_position.is_none() {
             *psbt = Psbt::from_unsigned_tx(transaction).unwrap();
         }
 
@@ -108,22 +119,12 @@ impl Wallet {
 
             let mut asset_transition_builder = stock.transition_builder(contract_id, "transfer")?;
 
-            let mut asset_available_amt: u64 = 0;
             let mut uda_state = None;
             for (_, opout_state_map) in
                 stock.contract_assignments_for(contract_id, prev_outputs.iter().copied())?
             {
                 for (opout, state) in opout_state_map {
-                    if let AllocatedState::Amount(amt) = &state {
-                        // a transition can't spend more than u64::MAX of an asset, which BFA
-                        // assets (with no supply limit) can exceed
-                        asset_available_amt = asset_available_amt
-                            .checked_add(amt.as_u64())
-                            .ok_or_else(|| Error::InvalidColoringInfo {
-                                details: s!("total asset amount in inputs exceeds u64::MAX"),
-                            })?;
-                    } else if let AllocatedState::Data(_) = &state {
-                        asset_available_amt = 1;
+                    if let AllocatedState::Data(_) = &state {
                         // there can be only a single state when contract is UDA
                         uda_state = Some(state.clone());
                     }
@@ -132,29 +133,12 @@ impl Wallet {
             }
 
             let mut beneficiaries = vec![];
-            let mut sending_amt: u64 = 0;
-            for (mut vout, amount) in asset_coloring_info.output_map {
+            for (vout, amount) in asset_coloring_info.output_map {
                 if amount == 0 {
                     continue;
                 }
-                if opreturn_first {
-                    vout = vout
-                        .checked_add(1)
-                        .ok_or_else(|| Error::InvalidColoringInfo {
-                            details: s!("vout in output_map is too large"),
-                        })?;
-                }
-                sending_amt =
-                    sending_amt
-                        .checked_add(amount)
-                        .ok_or_else(|| Error::InvalidColoringInfo {
-                            details: s!("total amount in output_map exceeds u64::MAX"),
-                        })?;
-                if vout as usize > psbt.outputs.len() {
-                    return Err(Error::InvalidColoringInfo {
-                        details: s!("invalid vout in output_map, does not exist in the given PSBT"),
-                    });
-                }
+                // can't overflow, check_output_map checked the shifted vout exists
+                let vout = vout + u32::from(opreturn_first);
                 let graph_seal = if let Some(blinding) = asset_coloring_info.static_blinding {
                     GraphSeal::with_blinded_vout(vout, blinding)
                 } else {
@@ -180,14 +164,6 @@ impl Wallet {
                     }
                 }
             }
-            if sending_amt > asset_available_amt {
-                return Err(Error::InvalidColoringInfo {
-                    details: format!(
-                        "total amount in output_map ({sending_amt}) greater than available ({asset_available_amt})"
-                    ),
-                });
-            }
-
             if let Some(nonce) = coloring_info.nonce {
                 asset_transition_builder = asset_transition_builder.set_nonce(nonce);
             }
@@ -196,6 +172,7 @@ impl Wallet {
             all_transitions.insert(contract_id, transition);
             asset_beneficiaries.insert(contract_id, beneficiaries);
         }
+        check_full_allocation(&stock, prev_outputs.iter().copied(), &coloring_info)?;
 
         let opreturn_index = psbt
             .unsigned_tx
