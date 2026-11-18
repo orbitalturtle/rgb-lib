@@ -188,6 +188,28 @@ fn confirmation_deadline_passed(batch_transfer: &DbBatchTransfer) -> bool {
         .is_some_and(|deadline| deadline.saturating_add(i64::from(margin)) < now().unix_timestamp())
 }
 
+/// Resolver archiving a single witness, the TX of an outgoing transfer that lost to a
+/// conflicting TX, and answering for no other: those are reported back by
+/// [`RgbStock::update_witnesses`] and left with the ord they had.
+struct LostWitnessResolver(RgbTxid);
+
+impl ResolveWitness for LostWitnessResolver {
+    fn resolve_witness(&self, witness_id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
+        if witness_id == self.0 {
+            Ok(WitnessStatus::Unresolved)
+        } else {
+            Err(WitnessResolverError::ResolverIssue(
+                Some(witness_id),
+                s!("only the lost witness is resolved"),
+            ))
+        }
+    }
+
+    fn check_chain_net(&self, _chain_net: ChainNet) -> Result<(), WitnessResolverError> {
+        Ok(())
+    }
+}
+
 /// Whether an incoming transfer is expired, so it can be failed: a transfer waiting for the
 /// broadcast of a TX the sender proxy may still release to it (it has a broadcast deadline) only
 /// once past the broadcast deadline plus the confirmation margin, a blind receive reserved on
@@ -1541,6 +1563,108 @@ pub trait WalletOnline: WalletOffline {
             }
         }
         Ok(false)
+    }
+
+    /// Whether the TX of an outgoing transfer has lost to a conflicting TX, i.e. it is unknown to
+    /// the indexer and one of its inputs has been spent by another TX with at least the batch
+    /// transfer's `min_confirmations`, so that it can never confirm.
+    ///
+    /// Only plain transfers are considered: other operations (e.g. an inflation, which also acts
+    /// on the known circulating supply) may record more than failing the transfer would undo.
+    fn outgoing_tx_lost(
+        &self,
+        batch_transfer: &DbBatchTransfer,
+        db_data: &DbData,
+    ) -> Result<bool, Error> {
+        if batch_transfer
+            .get_asset_transfers(&db_data.asset_transfers)
+            .iter()
+            .any(|at| at.transition_type != Some(TypeOfTransition::Transfer))
+        {
+            return Ok(false);
+        }
+        let txid = batch_transfer
+            .txid
+            .as_deref()
+            .expect("batch transfer should have a TXID");
+        let tx = self.get_signed_tx(&self.get_transfer_dir(txid))?;
+        let min_confirmations = u64::from(batch_transfer.min_confirmations);
+        let own_txid = tx.compute_txid();
+        for input in &tx.input {
+            if self.indexer().output_spent_with_confirmations(
+                &input.previous_output,
+                min_confirmations,
+                Some(&own_txid),
+            )? {
+                // the TX itself spends it if it has been confirmed meanwhile
+                return Ok(self.indexer().get_tx_confirmations(txid)?.is_none());
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fail an outgoing transfer whose TX has lost to a conflicting TX, undoing what its broadcast
+    /// recorded: its RGB state, as its witness is archived in the RGB runtime, invalidating its
+    /// operations so that its inputs hold their allocations again, the inputs the conflicting TX
+    /// didn't spend, which are unspent again, and its outputs, which will never exist, also for
+    /// BDK, so that a later sync can't bring them back (e.g. when the conflicting TX spends an
+    /// input the wallet doesn't own, which BDK doesn't track).
+    fn fail_lost_outgoing_transfer(
+        &mut self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<DbBatchTransfer, Error> {
+        let txid = batch_transfer
+            .txid
+            .clone()
+            .expect("batch transfer should have a TXID");
+        let tx = self.get_signed_tx(&self.get_transfer_dir(&txid))?;
+        let witness_id = RgbTxid::from_str(&txid).map_err(|e| Error::Internal {
+            details: e.to_string(),
+        })?;
+        // mined witnesses are skipped (after_height), the others the resolver doesn't answer for
+        let update_res = self.rgb_stock(txn)?.update_witnesses(
+            &LostWitnessResolver(witness_id),
+            u32::MAX,
+            vec![witness_id],
+        )?;
+        if update_res.failed.contains_key(&witness_id) {
+            return Err(Error::Internal {
+                details: format!("cannot archive the witness of lost TX {txid}"),
+            });
+        }
+        let failed = self.fail_batch_transfer(txn, batch_transfer)?;
+        for input in &tx.input {
+            if let Some(db_txo) = txn.get_txo(&Outpoint::from(input.previous_output))?
+                && db_txo.spent
+                && !self
+                    .indexer()
+                    .output_spent_on_chain(&input.previous_output)?
+            {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.spent = ActiveValue::Set(false);
+                txn.update_txo(db_txo)?;
+            }
+        }
+        for vout in 0..tx.output.len() as u32 {
+            let outpoint = Outpoint {
+                txid: txid.clone(),
+                vout,
+            };
+            if let Some(db_txo) = txn.get_txo(&outpoint)?
+                && db_txo.exists
+            {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.exists = ActiveValue::Set(false);
+                txn.update_txo(db_txo)?;
+            }
+        }
+        // last: evicting the TX from BDK is persisted right away, which the DB transaction can't
+        // undo
+        self.bdk_wallet_mut()
+            .apply_evicted_txs([(tx.compute_txid(), now().unix_timestamp() as u64)]);
+        self.flush_bdk_pending()?;
+        Ok(failed)
     }
 
     /// The signed TX of an outgoing transfer, read from its signed PSBT for a transfer created by
@@ -4418,6 +4542,16 @@ pub trait WalletOnline: WalletOffline {
                     self.rebroadcast_received_tx(recipient_id);
                 }
             }
+        }
+
+        // an outgoing transfer whose TX can no longer confirm, as it lost to a conflicting TX
+        // (e.g. a counterparty's spend of a shared input), is failed and its RGB state undone
+        if confirmations.is_none() && !incoming && self.outgoing_tx_lost(batch_transfer, db_data)? {
+            info!(
+                self.logger(),
+                "The TX lost to a conflicting one, failing the transfer"
+            );
+            return Ok(Some(self.fail_lost_outgoing_transfer(txn, batch_transfer)?));
         }
 
         let Some(confirmations) = confirmations else {
