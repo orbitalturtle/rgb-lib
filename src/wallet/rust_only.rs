@@ -344,13 +344,20 @@ impl Wallet {
     )]
     #[cfg_attr(not(feature = "_online"), doc = "`send_begin` method.")]
     ///
+    /// If the transfer is a donation the TX of the PSBT is embedded in the consignments, so
+    /// providing the signed PSBT allows also the recipients to broadcast it. Otherwise the
+    /// consignments always carry the unsigned TX.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     pub fn create_consignments(&self, psbt: String) -> Result<(), Error> {
         info!(self.logger(), "Creating consignments...");
 
         let psbt = Psbt::from_str(&psbt)?;
-        let (_, transfer_dir, info_contents, fascia) = self.get_transfer_end_data(&psbt)?;
+        let (_, transfer_dir, info_contents, mut fascia) = self.get_transfer_end_data(&psbt)?;
+        if info_contents.donation {
+            fascia.update_witness_tx(psbt.extract_tx().map_err(InternalError::from)?);
+        }
         let txn = self.database().begin_transaction()?;
         self.gen_consignments(&txn, &fascia, &info_contents.transfers, &transfer_dir)?;
         txn.commit()?;

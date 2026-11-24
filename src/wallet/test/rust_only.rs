@@ -1177,6 +1177,72 @@ fn create_consignments_success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+fn create_consignments_signed() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    for donation in [true, false] {
+        let asset = party.issue_asset_nia(None);
+        let receive_data = rcv_party.blind_receive_asset_expiry(None, None);
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(10),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let begin = party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map,
+                donation,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                default_send_expiration(),
+                Some(PROXY_ENDPOINT.clone()),
+                false,
+            )
+            .unwrap();
+        let unsigned_tx = Psbt::from_str(&begin.psbt).unwrap().unsigned_tx;
+        let signed_psbt = party.wallet.sign_psbt(begin.psbt.clone(), None).unwrap();
+        let signed_tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+        assert_ne!(signed_tx, unsigned_tx);
+        let txid = signed_tx.compute_txid();
+        let consignment_path = party
+            .wallet
+            .get_send_consignment_path(&asset.asset_id, &txid.to_string());
+        let witness_tx = || {
+            let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
+            let bundle = consignment
+                .bundles
+                .iter()
+                .find(|b| b.witness_id() == txid)
+                .unwrap();
+            bundle.tx.clone()
+        };
+
+        // unsigned PSBT: the unsigned TX is embedded
+        party.wallet.create_consignments(begin.psbt).unwrap();
+        assert_eq!(witness_tx(), unsigned_tx);
+
+        // signed PSBT: the signed TX is only embedded for donations
+        party.wallet.create_consignments(signed_psbt).unwrap();
+        let expected = if donation { &signed_tx } else { &unsigned_tx };
+        assert_eq!(&witness_tx(), expected);
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 fn offline() {
     initialize();
 
