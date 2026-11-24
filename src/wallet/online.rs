@@ -5,7 +5,7 @@
 use super::*;
 
 /// Signed TX of an outgoing transfer, saved to broadcast it once the transfer is accepted
-const SIGNED_TX_FILE: &str = "signed.tx";
+pub(crate) const SIGNED_TX_FILE: &str = "signed.tx";
 /// Signed PSBT of an outgoing transfer, saved instead of its TX by previous versions
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
 /// Signed TX released to a recipient, saved to broadcast it again until the broadcast deadline

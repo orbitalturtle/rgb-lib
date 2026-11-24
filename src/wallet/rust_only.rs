@@ -631,8 +631,15 @@ impl Wallet {
             return Err(Error::WrongOperation { txid });
         }
 
+        // saved like send_end does, as refresh needs it to tell if the TX lost to a conflict
+        let tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
+        atomic_write(
+            &transfer_dir.join(online::SIGNED_TX_FILE),
+            hex::encode(bdk_wallet::bitcoin::consensus::encode::serialize(&tx)).as_bytes(),
+        )?;
+
         // this will also update the DB with the new UTXOs and BDK
-        self.broadcast_psbt(&txn, &psbt)?;
+        self.broadcast_signed_tx(&txn, tx)?;
 
         let consignment_hashes = self.consignment_hashes(&transfer_dir, &info_contents)?;
         let batch_transfer_idx = self.update_or_save_transfers(
