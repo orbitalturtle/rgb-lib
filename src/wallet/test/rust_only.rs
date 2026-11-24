@@ -114,7 +114,41 @@ fn success() {
     assert_eq!(seal.vout.into_u32(), vout);
     assert_eq!(seal.blinding, blinding);
 
-    // color PSBT and consume
+    // a TX other than the colored one is refused
+    let mut other_tx = psbt.unsigned_tx.clone();
+    other_tx.output.pop();
+    let result = party_send.wallet.create_consignments_from_fascia(
+        fascia.clone(),
+        beneficiaries.clone(),
+        Some(other_tx),
+    );
+    assert_matches!(result, Err(Error::InvalidTxid));
+
+    // create the consignments, without a signed TX and with one (a witness doesn't change the TXID)
+    let unsigned_transfers = party_send
+        .wallet
+        .create_consignments_from_fascia(fascia.clone(), beneficiaries.clone(), None)
+        .unwrap();
+    let mut signed_tx = psbt.unsigned_tx.clone();
+    signed_tx.input[0].witness.push([1; 64]);
+    let signed_transfers = party_send
+        .wallet
+        .create_consignments_from_fascia(fascia.clone(), beneficiaries, Some(signed_tx.clone()))
+        .unwrap();
+    for (transfers, tx) in [
+        (&unsigned_transfers, &psbt.unsigned_tx),
+        (&signed_transfers, &signed_tx),
+    ] {
+        assert_eq!(transfers.len(), 1);
+        let bundle = transfers[0]
+            .bundles
+            .iter()
+            .find(|b| b.witness_id() == signed_tx.compute_txid())
+            .unwrap();
+        assert_eq!(&bundle.tx, tx);
+    }
+
+    // color PSBT and consume (the RGB state is still there, as it hasn't been consumed)
     let transfers = party_send
         .wallet
         .color_psbt_and_consume(&mut psbt_copy, coloring_info)
@@ -128,8 +162,8 @@ fn success() {
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
     let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
-    assert_eq!(transfers.len(), 1);
-    transfers
+    assert_eq!(transfers, unsigned_transfers);
+    signed_transfers
         .first()
         .unwrap()
         .save_file(&consignment_path)
