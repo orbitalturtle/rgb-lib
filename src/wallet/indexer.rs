@@ -378,9 +378,31 @@ impl Indexer {
         })
     }
 
+    /// The confirmations of a TX mined at `height`.
+    #[cfg(any(feature = "electrum", feature = "esplora"))]
+    fn confirmations_at(&self, height: u64) -> Result<u64, Error> {
+        let tip = u64::from(self.get_latest_block_height()?);
+        Ok((tip + 1).saturating_sub(height))
+    }
+
     /// Whether the output at `outpoint` has been spent by a confirmed TX. The output of a TX that
     /// isn't confirmed, or doesn't exist, hasn't.
     pub(crate) fn output_spent_on_chain(&self, outpoint: &BdkOutPoint) -> Result<bool, Error> {
+        self.output_spent_with_confirmations(outpoint, 1, None)
+    }
+
+    /// Whether the output at `outpoint` has been spent by a TX with at least `min_confirmations`
+    /// confirmations (at least 1), other than `other_than` where the indexer tells the spending
+    /// TX (Electrum, Esplora). The output of a TX that isn't confirmed, or doesn't exist, hasn't.
+    pub(crate) fn output_spent_with_confirmations(
+        &self,
+        outpoint: &BdkOutPoint,
+        min_confirmations: u64,
+        other_than: Option<&Txid>,
+    ) -> Result<bool, Error> {
+        let min_confirmations = std::cmp::max(min_confirmations, 1);
+        #[cfg(not(any(feature = "electrum", feature = "esplora")))]
+        let _ = other_than;
         Ok(match self {
             #[cfg(feature = "bitcoind")]
             Indexer::Bitcoind(client) => {
@@ -401,10 +423,30 @@ impl Indexer {
                 }
                 // without the mempool, the node reports the output of a confirmed TX until a
                 // confirmed TX spends it
-                client
+                if client
                     .get_tx_out(&outpoint.txid, outpoint.vout, Some(false))
                     .map_err(IndexerError::from)?
-                    .is_none()
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+                // the node can't tell which TX spent it: the spend is deep enough if it isn't in
+                // any of the blocks too recent to have enough confirmations
+                let tip = client.get_block_count().map_err(IndexerError::from)?;
+                let recent = std::cmp::min(min_confirmations - 1, tip);
+                for height in (tip + 1 - recent)..=tip {
+                    let hash = client.get_block_hash(height).map_err(IndexerError::from)?;
+                    let block = client.get_block(&hash).map_err(IndexerError::from)?;
+                    if block
+                        .txdata
+                        .iter()
+                        .flat_map(|tx| &tx.input)
+                        .any(|i| i.previous_output == *outpoint)
+                    {
+                        return Ok(false);
+                    }
+                }
+                true
             }
             #[cfg(feature = "electrum")]
             Indexer::Electrum(client) => {
@@ -428,7 +470,10 @@ impl Indexer {
                     .script_get_history(&output.script_pubkey)
                     .map_err(IndexerError::from)?;
                 for entry in history {
-                    if entry.height <= 0 || entry.tx_hash == outpoint.txid {
+                    if entry.height <= 0
+                        || entry.tx_hash == outpoint.txid
+                        || Some(&entry.tx_hash) == other_than
+                    {
                         continue;
                     }
                     let tx = client
@@ -436,18 +481,34 @@ impl Indexer {
                         .transaction_get(&entry.tx_hash)
                         .map_err(IndexerError::from)?;
                     if tx.input.iter().any(|i| i.previous_output == *outpoint) {
-                        return Ok(true);
+                        return Ok(min_confirmations == 1
+                            || self.confirmations_at(entry.height as u64)? >= min_confirmations);
                     }
                 }
                 false
             }
             #[cfg(feature = "esplora")]
-            Indexer::Esplora(client) => client
-                .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
-                .map_err(IndexerError::from)?
-                .is_some_and(|status| {
-                    status.spent && status.status.is_some_and(|tx_status| tx_status.confirmed)
-                }),
+            Indexer::Esplora(client) => {
+                let Some(status) = client
+                    .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+                    .map_err(IndexerError::from)?
+                else {
+                    return Ok(false);
+                };
+                if other_than.is_some() && status.txid.as_ref() == other_than {
+                    return Ok(false);
+                }
+                match status.status.filter(|_| status.spent) {
+                    Some(tx_status) if tx_status.confirmed => match tx_status.block_height {
+                        _ if min_confirmations == 1 => true,
+                        Some(height) => {
+                            self.confirmations_at(u64::from(height))? >= min_confirmations
+                        }
+                        None => false,
+                    },
+                    _ => false,
+                }
+            }
         })
     }
 
@@ -1106,7 +1167,11 @@ mod tests {
     }
 
     #[cfg(feature = "esplora")]
-    fn run_esplora_output_spent_on_chain_case(outspend_body: &str) -> bool {
+    fn run_esplora_output_spent_case(
+        outspend_body: &str,
+        min_confirmations: u64,
+        other_than: Option<&Txid>,
+    ) -> bool {
         let mut server = mockito::Server::new();
         let mock = server
             .mock("GET", format!("/tx/{TEST_TXID}/outspend/1").as_str())
@@ -1114,12 +1179,17 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(outspend_body)
             .create();
+        let _tip_mock = server
+            .mock("GET", "/blocks/tip/height")
+            .with_status(200)
+            .with_body("100")
+            .create();
         let outpoint = BdkOutPoint {
             txid: Txid::from_str(TEST_TXID).unwrap(),
             vout: 1,
         };
         let res = esplora_indexer(&server.url())
-            .output_spent_on_chain(&outpoint)
+            .output_spent_with_confirmations(&outpoint, min_confirmations, other_than)
             .unwrap();
         mock.assert();
         res
@@ -1128,17 +1198,31 @@ mod tests {
     #[cfg(feature = "esplora")]
     #[test]
     fn test_esplora_output_spent_on_chain() {
-        // spent by a confirmed TX
-        assert!(run_esplora_output_spent_on_chain_case(&format!(
+        // spent by a TX confirmed at height 95, with the tip at 100: 6 confirmations
+        let confirmed = format!(
             r#"{{"spent": true, "txid": "{TEST_TXID}", "vin": 0, "status": {{"confirmed": true, "block_height": 95, "block_hash": "0000000000000000000000000000000000000000000000000000000000000000", "block_time": 1600000000}}}}"#
-        )));
+        );
+        assert!(run_esplora_output_spent_case(&confirmed, 0, None));
+        assert!(run_esplora_output_spent_case(&confirmed, 1, None));
+        assert!(run_esplora_output_spent_case(&confirmed, 6, None));
+        assert!(!run_esplora_output_spent_case(&confirmed, 7, None));
+        // spent by the TX to ignore
+        let spender = Txid::from_str(TEST_TXID).unwrap();
+        assert!(!run_esplora_output_spent_case(
+            &confirmed,
+            1,
+            Some(&spender)
+        ));
         // spent by a TX in the mempool
-        assert!(!run_esplora_output_spent_on_chain_case(&format!(
+        let mempool = format!(
             r#"{{"spent": true, "txid": "{TEST_TXID}", "vin": 0, "status": {{"confirmed": false}}}}"#
-        )));
+        );
+        assert!(!run_esplora_output_spent_case(&mempool, 1, None));
         // unspent
-        assert!(!run_esplora_output_spent_on_chain_case(
-            r#"{"spent": false}"#
+        assert!(!run_esplora_output_spent_case(
+            r#"{"spent": false}"#,
+            1,
+            None
         ));
     }
 }

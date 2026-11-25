@@ -748,6 +748,8 @@ mod list_transfers;
 #[cfg(feature = "electrum")]
 mod list_unspents;
 mod load;
+#[cfg(feature = "electrum")]
+mod lost_tx;
 #[cfg(all(feature = "electrum", feature = "rgb_fs_store_migration"))]
 mod migrate;
 mod mint;
