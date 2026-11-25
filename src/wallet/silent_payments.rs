@@ -2,9 +2,9 @@
 //!
 //! This module defines the wallet methods to send RGB assets to a silent payment recipient and to
 //! receive them. The received outputs are then spent by the other operations, as other ones holding
-//! the assets are, with their tweak in the PSBT (BIP376). The
-//! proof is expected to reach the recipient by means of the application, which can encrypt it with
-//! keys derived from the shared secret.
+//! the assets are, with their tweak in a PSBT field borrowed from BIP376. The proof is expected to
+//! reach the recipient by means of the application, which can encrypt it with keys derived from the
+//! shared secret.
 //!
 //! Outputs are derived by `bitcoin-silent-payments` (libsecp256k1), which doesn't expose the shared
 //! secret: that is computed here, refusing it if it doesn't yield the same output.

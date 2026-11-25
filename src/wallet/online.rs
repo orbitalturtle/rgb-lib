@@ -403,7 +403,8 @@ impl ResolveRejectList for WalletRejectListResolver<'_> {
 /// The weight of the witness of a taproot key path spend (with a default sighash).
 const TAPROOT_KEY_SPEND_WEIGHT: bitcoin::Weight = bitcoin::Weight::from_wu(66);
 
-/// The PSBT input spending a foreign output, carrying its tweak (BIP376).
+/// The PSBT input spending a foreign output, carrying its tweak (see
+/// [`PSBT_IN_SP_TWEAK`]).
 fn foreign_psbt_input(
     outpoint: BdkOutPoint,
     foreign: &ForeignOutput,
