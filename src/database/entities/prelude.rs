@@ -34,6 +34,8 @@ pub use super::rgb_secret_seal_opout::Entity as RgbSecretSealOpout;
 pub use super::rgb_type_lib::Entity as RgbTypeLib;
 pub use super::rgb_witness::Entity as RgbWitness;
 pub use super::rgb_witness_ord::Entity as RgbWitnessOrd;
+#[cfg(all(feature = "silent_payments", feature = "_online"))]
+pub use super::silent_payment_output::Entity as SilentPaymentOutput;
 pub use super::token::Entity as Token;
 pub use super::token_media::Entity as TokenMedia;
 pub use super::transfer::Entity as Transfer;

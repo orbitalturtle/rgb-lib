@@ -497,6 +497,37 @@ impl DbTxn {
         }
     }
 
+    #[cfg(all(feature = "silent_payments", feature = "_online"))]
+    pub(crate) fn set_silent_payment_output(
+        &self,
+        outpoint: &Outpoint,
+        tweak: &[u8],
+        batch_transfer_idx: i32,
+    ) -> Result<(), Error> {
+        let output = entities::silent_payment_output::ActiveModel {
+            outpoint: ActiveValue::Set(outpoint.to_string()),
+            tweak: ActiveValue::Set(tweak.to_vec()),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            ..Default::default()
+        };
+        block_on(SilentPaymentOutput::insert(output).exec(self.inner()))?;
+        Ok(())
+    }
+
+    /// The index of the batch transfer that received the given silent payment output, if any.
+    #[cfg(all(feature = "silent_payments", feature = "_online"))]
+    pub(crate) fn get_silent_payment_batch_transfer(
+        &self,
+        outpoint: &Outpoint,
+    ) -> Result<Option<i32>, Error> {
+        Ok(block_on(
+            SilentPaymentOutput::find()
+                .filter(entities::silent_payment_output::Column::Outpoint.eq(outpoint.to_string()))
+                .one(self.inner()),
+        )?
+        .map(|o| o.batch_transfer_idx))
+    }
+
     pub(crate) fn set_invoice(&self, invoice: DbInvoiceActMod) -> Result<i32, Error> {
         let res = block_on(Invoice::insert(invoice).exec(self.inner()))?;
         Ok(res.last_insert_id)
@@ -1391,6 +1422,8 @@ impl DbTxn {
                     })
                     // or with pending blinded incoming transfers
                     || u.pending_blinded > 0
+                    // or not known to BDK, so never selected as inputs
+                    || !u.utxo.exists
                     ))
                     // spent
                     || (u.utxo.spent

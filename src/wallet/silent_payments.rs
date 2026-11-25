@@ -1,6 +1,7 @@
 //! Silent payments (BIP352) functionality, experimental and limited to regtest.
 //!
-//! This module defines the wallet methods to send RGB assets to a silent payment recipient. The
+//! This module defines the wallet methods to send RGB assets to a silent payment recipient and to
+//! receive them. The received outputs cannot be spent yet. The
 //! proof is expected to reach the recipient by means of the application, which can encrypt it with
 //! keys derived from the shared secret.
 //!
@@ -8,12 +9,14 @@
 //! secret: that is computed here, refusing it if it doesn't yield the same output.
 
 use bdk_wallet::bitcoin::{
-    CompressedPublicKey,
+    CompressedPublicKey, EcdsaSighashType,
     hashes::{Hash, HashEngine, sha256},
     key::{Keypair, Parity, TapTweak, TweakedPublicKey},
     secp256k1::{PublicKey, Scalar, SecretKey, XOnlyPublicKey, ecdh::shared_secret_point},
 };
-use bitcoin_silent_payments::{LexMin, send::SpGroup};
+use bitcoin_silent_payments::{
+    LexMin, compat_v32::create_prevouts_summary_32, receive::SpRx, send::SpGroup,
+};
 
 use super::*;
 
@@ -46,6 +49,17 @@ pub struct SilentPaymentSendBeginResult {
     pub send_begin: SendBeginResult,
     /// Vout of the output paying the recipient
     pub vout: u32,
+    /// BIP352 shared secret, known only to the parties: who has it can recognize the payment
+    pub shared_secret: PublicKey,
+}
+
+/// A silent payment found in a TX.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SilentPayment {
+    /// Outpoint of the output paying this wallet
+    pub outpoint: Outpoint,
+    /// Bitcoin amount of the output, in sats
+    pub amount_sat: u64,
     /// BIP352 shared secret, known only to the parties: who has it can recognize the payment
     pub shared_secret: PublicKey,
 }
@@ -222,6 +236,105 @@ fn psbt_inputs(psbt: &Psbt, master_xprv: &Xpriv) -> Result<Vec<SpInput>, Error> 
     Ok(inputs)
 }
 
+/// The public keys of the inputs of a signed TX, taproot and plain, `None` unless all of them are
+/// P2WPKH (`SIGHASH_ALL`) or P2TR key path (`SIGHASH_DEFAULT`) ones.
+fn input_pubkeys(
+    tx: &BdkTransaction,
+    prevouts: &[TxOut],
+) -> Option<(Vec<XOnlyPublicKey>, Vec<PublicKey>)> {
+    if tx.is_coinbase() || tx.input.len() != prevouts.len() {
+        return None;
+    }
+    let (mut taproot, mut plain) = (vec![], vec![]);
+    for (txin, prevout) in tx.input.iter().zip(prevouts) {
+        if !txin.script_sig.is_empty() {
+            return None;
+        }
+        let script = &prevout.script_pubkey;
+        let witness = txin.witness.to_vec();
+        match witness.as_slice() {
+            [signature] if script.is_p2tr() && signature.len() == 64 => {
+                taproot.push(xonly_output_key(script).ok()?);
+            }
+            [signature, pubkey]
+                if script.is_p2wpkh()
+                    && signature.last() == Some(&(EcdsaSighashType::All as u8)) =>
+            {
+                let pubkey = CompressedPublicKey::from_slice(pubkey).ok()?;
+                if ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash()) != *script {
+                    return None;
+                }
+                plain.push(pubkey.0);
+            }
+            _ => return None,
+        }
+    }
+    Some((taproot, plain))
+}
+
+/// Find the output of a TX paying the given keys, `None` if there isn't exactly one.
+fn receiver_scan(
+    tx: &BdkTransaction,
+    prevouts: &[TxOut],
+    scan_key: &SecretKey,
+    spend: &PublicKey,
+) -> Result<Option<(u32, SpOutput)>, Error> {
+    let candidates: Vec<XOnlyPublicKey> = tx
+        .output
+        .iter()
+        .filter(|o| o.script_pubkey.is_p2tr())
+        .filter_map(|o| xonly_output_key(&o.script_pubkey).ok())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let Some((taproot, plain)) = input_pubkeys(tx, prevouts) else {
+        return Ok(None);
+    };
+    let lex_min = lex_min(tx.input.iter().map(|i| &i.previous_output))?;
+    // the keys may sum up to infinity, in which case this is not a silent payment
+    let Ok(summary) = create_prevouts_summary_32(&lex_min, &taproot, &plain) else {
+        return Ok(None);
+    };
+    let Ok(found) = SpRx::new_v32(*scan_key, *spend).scan_v32(&summary, &candidates) else {
+        return Ok(None);
+    };
+    if found.is_empty() {
+        return Ok(None);
+    }
+
+    let pubkeys: Vec<PublicKey> = taproot
+        .iter()
+        .map(|k| k.public_key(Parity::Even))
+        .chain(plain)
+        .collect();
+    let pubkey_sum =
+        PublicKey::combine_keys(&pubkeys.iter().collect::<Vec<_>>()).map_err(sp_error)?;
+    let tweaked_sum = pubkey_sum
+        .mul_tweak(&Secp256k1::new(), &input_hash(&lex_min, &pubkey_sum)?)
+        .map_err(sp_error)?;
+    let output = derive_output(ecdh_point(&tweaked_sum, scan_key)?, spend)?;
+    let key = xonly_output_key(&output.script)?;
+    if !found
+        .iter()
+        .any(|(k, meta)| *k == key && meta.tweak.to_be_bytes() == output.tweak.secret_bytes())
+    {
+        return Err(sp_error("found output mismatch"));
+    }
+    let vouts: Vec<usize> = tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey == output.script)
+        .map(|(vout, _)| vout)
+        .collect();
+    // an error would let any payer stop the recipient from scanning
+    Ok(match vouts.as_slice() {
+        [vout] => Some((*vout as u32, output)),
+        _ => None,
+    })
+}
+
 impl Wallet {
     fn check_silent_payments(&self) -> Result<(), Error> {
         self.check_xprv()?;
@@ -239,6 +352,227 @@ impl Wallet {
         let mnemonic = keys.mnemonic.as_deref().ok_or(Error::WatchOnly)?;
         let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)?;
         Ok(Xpriv::new_master(self.bitcoin_network(), &mnemonic.to_seed("")).expect("valid seed"))
+    }
+
+    /// The scan and spend secret keys, derived with the purpose of BIP352 but the coin type of RGB:
+    /// a bitcoin-only wallet with the same mnemonic must not find (and spend) the outputs, as that
+    /// would destroy their assets.
+    fn silent_payment_keys(&self) -> Result<(SecretKey, SecretKey), Error> {
+        let secp = Secp256k1::new();
+        let account = [
+            ChildNumber::from_hardened_idx(352).expect("valid index"),
+            ChildNumber::from_hardened_idx(get_coin_type(&self.bitcoin_network(), true))
+                .expect("valid index"),
+            ChildNumber::from_hardened_idx(0).expect("valid index"),
+        ];
+        let account = self.master_xprv()?.derive_priv(&secp, &account)?;
+        let derive = |child: u32| -> Result<SecretKey, Error> {
+            let path = [
+                ChildNumber::from_hardened_idx(child).expect("valid index"),
+                ChildNumber::from_normal_idx(0).expect("valid index"),
+            ];
+            Ok(account.derive_priv(&secp, &path)?.private_key)
+        };
+        Ok((derive(1)?, derive(0)?))
+    }
+
+    /// Return the public keys others can send RGB assets to with
+    /// [`send_begin_silent_payment`](Wallet::send_begin_silent_payment).
+    ///
+    /// A wallet with private keys is required.
+    ///
+    /// <div class="warning">This method is experimental and only works on regtest</div>
+    pub fn get_silent_payment_pubkeys(&self) -> Result<SilentPaymentPubkeys, Error> {
+        self.check_silent_payments()?;
+        let secp = Secp256k1::new();
+        let (scan_key, spend_key) = self.silent_payment_keys()?;
+        Ok(SilentPaymentPubkeys {
+            scan: scan_key.public_key(&secp),
+            spend: spend_key.public_key(&secp),
+        })
+    }
+
+    /// Find the silent payment to this wallet in the given signed TX, if any, given the outputs its
+    /// inputs spend (in the same order).
+    ///
+    /// The data is not checked to be on-chain. A TX with several payments to this wallet, or with
+    /// inputs other than P2WPKH and P2TR key path ones, is ignored.
+    ///
+    /// A wallet with private keys is required.
+    ///
+    /// <div class="warning">This method is experimental and only works on regtest</div>
+    pub fn scan_silent_payment(
+        &self,
+        tx: &BdkTransaction,
+        prevouts: &[TxOut],
+    ) -> Result<Option<SilentPayment>, Error> {
+        self.check_silent_payments()?;
+        Ok(self
+            .scan_silent_payment_impl(tx, prevouts)?
+            .map(|(payment, _)| payment))
+    }
+
+    fn scan_silent_payment_impl(
+        &self,
+        tx: &BdkTransaction,
+        prevouts: &[TxOut],
+    ) -> Result<Option<(SilentPayment, SpOutput)>, Error> {
+        let (scan_key, spend_key) = self.silent_payment_keys()?;
+        let spend = spend_key.public_key(&Secp256k1::new());
+        let Some((vout, output)) = receiver_scan(tx, prevouts, &scan_key, &spend)? else {
+            return Ok(None);
+        };
+        let payment = SilentPayment {
+            outpoint: Outpoint {
+                txid: tx.compute_txid().to_string(),
+                vout,
+            },
+            amount_sat: tx.output[vout as usize].value.to_sat(),
+            shared_secret: output.shared_secret,
+        };
+        Ok(Some((payment, output)))
+    }
+
+    /// Receive the RGB assets of a silent payment, found with
+    /// [`scan_silent_payment`](Wallet::scan_silent_payment), given its proof.
+    ///
+    /// The TX needs to be confirmed. The consignment is validated as any received one is and needs
+    /// to pay exactly `amount` of the asset to the output, otherwise nothing is saved. The transfer
+    /// is then settled by [`refresh`](Wallet::refresh).
+    ///
+    /// The received assets can't be spent yet. Seed and chain are enough to find the output again
+    /// but not the assets, which are in the backup of the wallet.
+    ///
+    /// Receiving the same output again has no effect.
+    ///
+    /// Return the index of the batch transfer.
+    ///
+    /// A wallet with private keys is required.
+    ///
+    /// <div class="warning">This method is experimental and only works on regtest</div>
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_silent_payment(
+        &mut self,
+        online: Online,
+        tx: &BdkTransaction,
+        prevouts: &[TxOut],
+        consignment_path: String,
+        asset_id: String,
+        amount: u64,
+        min_confirmations: u8,
+    ) -> Result<i32, Error> {
+        info!(self.logger(), "Receiving silent payment...");
+        self.check_silent_payments()?;
+        self.check_online(online)?;
+        let (payment, output) = self
+            .scan_silent_payment_impl(tx, prevouts)?
+            .ok_or_else(|| sp_error("the TX doesn't pay this wallet"))?;
+        let outpoint = payment.outpoint;
+
+        let txn = self.database().begin_transaction()?;
+        if let Some(batch_transfer_idx) = txn.get_silent_payment_batch_transfer(&outpoint)? {
+            return Ok(batch_transfer_idx);
+        }
+        if self
+            .indexer()
+            .get_tx_confirmations(&outpoint.txid)?
+            .is_none_or(|confirmations| confirmations == 0)
+        {
+            return Err(sp_error("the TX is not confirmed"));
+        }
+        let consignment =
+            RgbTransfer::load_file(&consignment_path).map_err(|_| Error::InvalidFilePath {
+                file_path: consignment_path.clone(),
+            })?;
+        if consignment.contract_id().to_string() != asset_id {
+            return Err(Error::InvalidConsignment);
+        }
+        // the consignment must commit to this very TX, not to another one paying the same script
+        if !consignment
+            .bundles
+            .iter()
+            .any(|b| b.witness_id().to_string() == outpoint.txid)
+        {
+            return Err(Error::InvalidConsignment);
+        }
+
+        // save the receive as an out-of-band witness one, which the consignment is for
+        let recipient_id =
+            crate::no_wallet::recipient_id_from_script_buf(output.script, self.bitcoin_network());
+        let beneficiary = XChainNet::<Beneficiary>::from_str(&recipient_id)
+            .map_err(|_| Error::InvalidRecipientID)?;
+        let operation_sk = gen_ed25519();
+        let created_at = now().unix_timestamp();
+        let receive_data = ReceiveDataInternal {
+            asset_id: None,
+            detected_assignment: Assignment::Fungible(amount),
+            invoice_string: RgbInvoiceBuilder::new(beneficiary).finish().to_string(),
+            recipient_id,
+            endpoints: vec![],
+            created_at,
+            expiration_timestamp: created_at + i64::from(MAX_EXPIRATION_SECS),
+            recipient_type_full: RecipientTypeFull::Witness { vout: None },
+            blind_seal: None,
+            // not a script of the BDK wallet
+            script_pubkey: None,
+            recipient_pubkey: operation_sk.verifying_key().to_bytes().to_vec(),
+            operation_secret_key: operation_sk.to_bytes().to_vec(),
+            encryption: Encryption::Optional,
+            quota: 1,
+            retention_deadline: None,
+            invoice_deadline: None,
+            receive_dir: None,
+        };
+        let batch_transfer_idx =
+            self.store_receive_transfer(&txn, &receive_data, min_confirmations)?;
+        let db_data = txn.get_db_data(false)?;
+        let batch_transfer =
+            txn.get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
+        let (asset_transfer, transfer) =
+            batch_transfer.get_incoming_transfer(&db_data.asset_transfers, &db_data.transfers)?;
+
+        let receive_path = self.get_receive_consignment_path(&transfer);
+        atomic_write_with(&receive_path, |tmp| {
+            fs::copy(&consignment_path, tmp)?;
+            Ok(())
+        })?;
+        let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
+        let updated = self.process_received_consignment(
+            &txn,
+            &batch_transfer,
+            &asset_transfer,
+            &transfer,
+            &receive_path,
+            ReceiveMode::OutOfBand {
+                media_file_paths: vec![],
+            },
+            &mut updated_batch_transfer,
+        )?;
+        // from here on an error rolls back everything, including the RGB data
+        let Some(updated) = updated.filter(|t| !t.failed()) else {
+            return Err(Error::InvalidConsignment);
+        };
+        if updated.txid.as_deref() != Some(outpoint.txid.as_str()) {
+            return Err(Error::InvalidConsignment);
+        }
+        let mut received = 0u64;
+        for coloring in txn.iter_colorings()? {
+            if coloring.asset_transfer_idx != asset_transfer.idx {
+                continue;
+            }
+            let Assignment::Fungible(amt) = coloring.assignment else {
+                return Err(Error::InvalidConsignment);
+            };
+            received = received.checked_add(amt).ok_or(Error::InvalidConsignment)?;
+        }
+        if received != amount {
+            return Err(Error::InvalidConsignment);
+        }
+        txn.set_silent_payment_output(&outpoint, &output.tweak.secret_bytes(), batch_transfer_idx)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Receive silent payment completed");
+        Ok(batch_transfer_idx)
     }
 
     /// Prepare the PSBT to send an RGB asset to a silent payment recipient, which is always a
