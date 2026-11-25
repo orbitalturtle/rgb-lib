@@ -5557,10 +5557,13 @@ pub trait WalletOnline: WalletOffline {
         fee_rate: FeeRate,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let change_addr = self.get_new_address()?.script_pubkey();
+        // the order of the set is random: sort it so the same inputs give the same TX
+        let mut input_outpoints: Vec<BdkOutPoint> = input_outpoints.into_iter().collect();
+        input_outpoints.sort_unstable();
         let mut builder = self.bdk_wallet_mut().build_tx();
         builder
             .add_data(&[0; 32])
-            .add_utxos(&input_outpoints.into_iter().collect::<Vec<_>>())
+            .add_utxos(&input_outpoints)
             .map_err(InternalError::from)?
             .manually_selected_only()
             .fee_rate(fee_rate)
