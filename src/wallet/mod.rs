@@ -12,6 +12,8 @@ pub(crate) mod offline;
 #[cfg(feature = "_online")]
 pub(crate) mod online;
 pub mod rust_only;
+#[cfg(all(feature = "silent_payments", feature = "_online"))]
+pub mod silent_payments;
 pub(crate) mod singlesig;
 pub mod utils;
 

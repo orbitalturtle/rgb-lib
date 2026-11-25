@@ -763,6 +763,8 @@ mod send;
 #[cfg(feature = "electrum")]
 mod send_btc;
 mod sign_psbt;
+#[cfg(all(feature = "silent_payments", feature = "_online"))]
+mod silent_payments;
 #[cfg(feature = "electrum")]
 mod sync;
 #[cfg(feature = "electrum")]

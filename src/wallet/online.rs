@@ -11,6 +11,9 @@ const RECEIVED_SIGNED_TX_FILE: &str = "rcv_signed.tx";
 
 const MIN_FEE_RATE: u64 = 1;
 
+/// Derives the script paying the recipient of a send from its PSBT, once its inputs are final.
+pub(crate) type DeriveScript<'a> = &'a dyn Fn(&Psbt) -> Result<ScriptBuf, Error>;
+
 pub(crate) const UTXO_SIZE: u32 = 1000;
 pub(crate) const UTXO_NUM: u8 = 5;
 
@@ -7311,6 +7314,47 @@ pub trait WalletOnline: WalletOffline {
         Ok(transfer_dir)
     }
 
+    /// Set the script paying the only recipient of a send, in both its PSBT and its recipient ID.
+    fn set_recipient_script(
+        &self,
+        psbt: &mut Psbt,
+        transfer_info_map: &mut BTreeMap<String, InfoAssetTransfer>,
+        script: ScriptBuf,
+    ) -> Result<(), Error> {
+        let invalid = |details: String| Error::InvalidRecipientData { details };
+        let mut recipients: Vec<&mut LocalRecipient> = transfer_info_map
+            .values_mut()
+            .flat_map(|t| t.recipients.iter_mut())
+            .collect();
+        let [recipient] = recipients.as_mut_slice() else {
+            return Err(invalid(s!("a single recipient is needed")));
+        };
+        let LocalRecipientData::Witness(witness_data) = &recipient.local_recipient_data else {
+            return Err(invalid(s!("a witness recipient is needed")));
+        };
+        // the recipient ID is part of the proxy IDs, already checked by now
+        if !recipient.transport_endpoints.is_empty() {
+            return Err(invalid(s!("the recipient cannot use a proxy")));
+        }
+        if psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|o| o.script_pubkey == script)
+        {
+            return Err(invalid(s!("the script is already paid")));
+        }
+        let output = &mut psbt.unsigned_tx.output[witness_data.vout as usize];
+        // the fee has been computed on the placeholder
+        if output.script_pubkey.len() != script.len() {
+            return Err(invalid(s!("the script differs in size")));
+        }
+        recipient.recipient_id =
+            crate::no_wallet::recipient_id_from_script_buf(script.clone(), self.bitcoin_network());
+        output.script_pubkey = script;
+        Ok(())
+    }
+
     /// Prepare the PSBT of an operation on a single asset (an inflation, a burn or a mint),
     /// retrying, as a send does, without the inputs found rejected by the asset's reject list:
     /// more inputs are then selected to make up for them, failing if there aren't enough.
@@ -7356,6 +7400,7 @@ pub trait WalletOnline: WalletOffline {
                 &mut rejected,
                 &mut reject_lists,
                 dry_run,
+                None,
             )? {
                 PrepareTransferPsbtResult::Retry => {
                     // start over from the original transfer info, with the assignments needed
@@ -7405,6 +7450,7 @@ pub trait WalletOnline: WalletOffline {
         rejected: &mut HashSet<Opout>,
         reject_lists: &mut HashMap<RejectListSource, RejectList>,
         dry_run: bool,
+        derive_script: Option<DeriveScript<'_>>,
     ) -> Result<PrepareTransferPsbtResult, Error> {
         // prepare BDK PSBT
         let mut all_inputs: HashSet<BdkOutPoint> = transfer_info_map
@@ -7423,6 +7469,12 @@ pub trait WalletOnline: WalletOffline {
             fee_rate_checked,
         )?;
         psbt.unsigned_tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
+
+        // the inputs are final: replace the placeholder paying the recipient
+        if let Some(derive_script) = derive_script {
+            let script = derive_script(&psbt)?;
+            self.set_recipient_script(&mut psbt, transfer_info_map, script)?;
+        }
 
         // prepare RGB PSBT
         let begin_operation_data = match self.prepare_rgb_psbt(
@@ -7518,6 +7570,35 @@ pub trait WalletOnline: WalletOffline {
         expiration_timestamp: Option<i64>,
         sender_transport_endpoint: Option<String>,
         dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        self.send_begin_derived_impl(
+            txn,
+            recipient_map,
+            donation,
+            fee_rate,
+            min_confirmations,
+            expiration_timestamp,
+            sender_transport_endpoint,
+            dry_run,
+            None,
+        )
+    }
+
+    /// Begin a send, optionally deriving the script paying its recipient from its final inputs, in
+    /// which case there must be a single witness recipient, paid to a placeholder script of the
+    /// same size and using the out-of-band exchange.
+    #[allow(clippy::too_many_arguments)]
+    fn send_begin_derived_impl(
+        &mut self,
+        txn: &DbTxn,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp: Option<i64>,
+        sender_transport_endpoint: Option<String>,
+        dry_run: bool,
+        derive_script: Option<DeriveScript<'_>>,
     ) -> Result<BeginOperationData, Error> {
         if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
             return Err(Error::InvalidRecipientMap);
@@ -7744,6 +7825,7 @@ pub trait WalletOnline: WalletOffline {
                 &mut rejected,
                 &mut reject_lists,
                 dry_run,
+                derive_script,
             )? {
                 PrepareTransferPsbtResult::Retry => continue,
                 PrepareTransferPsbtResult::Success(begin_operation_data) => {

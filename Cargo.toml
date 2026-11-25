@@ -38,6 +38,10 @@ bitcoin = { version = "0.32.102", default-features = false, features = [
     "base64",
     "std",
 ] }
+# experimental
+bitcoin-silent-payments = { version = "=0.1.0", optional = true, default-features = false, features = [
+    "compat_v32",
+] }
 chacha20poly1305 = { version = "0.11.0", optional = true, default-features = false, features = [
     "alloc",
 ] }
@@ -213,6 +217,9 @@ esplora_validation = [
     "rgb-ops/esplora_blocking",
 ]
 camel_case = []
+# experimental, regtest only: RGB transfers to silent payment (BIP352) recipients; needs an indexer
+# feature
+silent_payments = ["dep:bitcoin-silent-payments"]
 
 [profile.release]
 # make overflow bugs fail loudly instead of producing wrong amounts

@@ -934,7 +934,7 @@ impl Wallet {
         self.keys.mnemonic.is_none()
     }
 
-    fn check_xprv(&self) -> Result<(), Error> {
+    pub(crate) fn check_xprv(&self) -> Result<(), Error> {
         if self.watch_only() {
             error!(self.logger(), "Invalid operation for a watch only wallet");
             return Err(Error::WatchOnly);
