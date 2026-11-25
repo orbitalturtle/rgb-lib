@@ -92,6 +92,13 @@ impl DbBatchTransfer {
     }
 
     #[cfg(feature = "_online")]
+    /// Whether the signed TX was released (it's in the consignments created for a donation) before
+    /// ending the send: whoever holds it can broadcast it at any time.
+    pub(crate) fn initiated_and_released(&self) -> bool {
+        !self.incoming && self.tx_released && self.status.initiated()
+    }
+
+    #[cfg(feature = "_online")]
     /// Whether the transfer was created before the proxy protocol v1.0 (sender proxy, signed
     /// ACKs, encryption): such a transfer has no operation key and, since the protocol keeps no
     /// backward compatibility, can no longer be completed through a proxy.

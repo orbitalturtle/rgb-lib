@@ -337,6 +337,36 @@ impl Wallet {
         Ok(transfers)
     }
 
+    /// Mark the TX of an initiated transfer as released, if it's signed.
+    #[cfg(feature = "_online")]
+    fn release_tx(
+        &self,
+        txid: &str,
+        tx: &BdkTransaction,
+        transfer_dir: &Path,
+    ) -> Result<(), Error> {
+        if tx.input.iter().any(|i| i.witness.is_empty()) {
+            return Ok(());
+        }
+        let txn = self.database().begin_transaction()?;
+        let Some(batch_transfer) = txn
+            .get_batch_transfers_by_txid(txid)?
+            .into_iter()
+            .find(|bt| !bt.incoming && bt.status.initiated())
+        else {
+            return Ok(());
+        };
+        atomic_write(
+            &transfer_dir.join(SIGNED_TX_FILE),
+            hex::encode(bdk_wallet::bitcoin::consensus::encode::serialize(tx)).as_bytes(),
+        )?;
+        let mut updated: DbBatchTransferActMod = batch_transfer.into();
+        updated.tx_released = ActiveValue::Set(true);
+        txn.update_batch_transfer(&mut updated)?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()
+    }
+
     /// Create consignments for a PSBT created with the
     #[cfg_attr(
         feature = "_online",
@@ -348,15 +378,26 @@ impl Wallet {
     /// providing the signed PSBT allows also the recipients to broadcast it. Otherwise the
     /// consignments always carry the unsigned TX.
     ///
+    /// From when a signed TX is embedded anybody given the consignments can broadcast it, so the
+    /// transfer (unless begun as a dry run, which persists none) can no longer be failed until one
+    /// of its inputs has been spent by another confirmed transaction. The send can still be ended,
+    /// while a refresh completes it if the TX is found on-chain.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     pub fn create_consignments(&self, psbt: String) -> Result<(), Error> {
         info!(self.logger(), "Creating consignments...");
 
         let psbt = Psbt::from_str(&psbt)?;
-        let (_, transfer_dir, info_contents, mut fascia) = self.get_transfer_end_data(&psbt)?;
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))]
+        let (txid, transfer_dir, info_contents, mut fascia) = self.get_transfer_end_data(&psbt)?;
         if info_contents.donation {
-            fascia.update_witness_tx(psbt.extract_tx().map_err(InternalError::from)?);
+            let tx = psbt.extract_tx().map_err(InternalError::from)?;
+            // persisted before the consignments exist, so no consignment can carry the signed TX
+            // of a transfer that can still be failed
+            #[cfg(feature = "_online")]
+            self.release_tx(&txid, &tx, &transfer_dir)?;
+            fascia.update_witness_tx(tx);
         }
         let txn = self.database().begin_transaction()?;
         self.gen_consignments(&txn, &fascia, &info_contents.transfers, &transfer_dir)?;

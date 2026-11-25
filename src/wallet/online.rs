@@ -4,8 +4,6 @@
 
 use super::*;
 
-/// Signed TX of an outgoing transfer, saved to broadcast it once the transfer is accepted
-const SIGNED_TX_FILE: &str = "signed.tx";
 /// Signed PSBT of an outgoing transfer, saved instead of its TX by previous versions
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
 /// Signed TX released to a recipient, saved to broadcast it again until the broadcast deadline
@@ -1088,6 +1086,15 @@ pub trait WalletOnline: WalletOffline {
                 return Ok(TryFailBatchTransferOutcome::Failed);
             }
             return Ok(TryFailBatchTransferOutcome::Refreshed);
+        }
+        // the signed TX may be held by others, who can broadcast it at any time: the refresh above
+        // fails the transfer once the TX can no longer confirm, until then the fail is denied
+        if batch_transfer.initiated_and_released() {
+            info!(
+                self.logger(),
+                "The signed TX of the transfer was released, fail denied"
+            );
+            return Ok(TryFailBatchTransferOutcome::Denied);
         }
         // the refresh above may have been the first to check a received mint (see `is_mint`): the
         // fail is denied, as a mint expires only by its lock, which may have been made already, in
@@ -4787,6 +4794,27 @@ pub trait WalletOnline: WalletOffline {
         Ok(Some(self.broadcast_batch(txn, batch_transfer)?))
     }
 
+    /// Settle an initiated outgoing batch transfer whose signed TX was released (see
+    /// [`DbBatchTransfer::initiated_and_released`]): complete it if its TX is on-chain, fail it if
+    /// the TX can never confirm, otherwise leave it as is, as the TX may still be broadcast.
+    fn settle_released_batch(
+        &mut self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        if let Some(updated) = self.complete_batch_if_tx_on_chain(txn, batch_transfer)? {
+            return Ok(Some(updated));
+        }
+        if self.tx_inputs_spent_elsewhere(batch_transfer)? {
+            info!(
+                self.logger(),
+                "An input of the released TX has been spent by another confirmed transaction, failing the transfer"
+            );
+            return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
+        }
+        Ok(None)
+    }
+
     fn provide_out_of_band_ack_impl(
         &mut self,
         txn: &DbTxn,
@@ -5080,15 +5108,19 @@ pub trait WalletOnline: WalletOffline {
         debug!(self.logger(), "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming;
         if !filter.is_empty() {
-            let requested = RefreshFilter {
-                status: RefreshTransferStatus::try_from(transfer.status).expect("pending status"),
-                incoming,
+            // there is no filter for an initiated transfer
+            let Ok(status) = RefreshTransferStatus::try_from(transfer.status) else {
+                return Ok(None);
             };
+            let requested = RefreshFilter { status, incoming };
             if !filter.contains(&requested) {
                 return Ok(None);
             }
         }
         match transfer.status {
+            TransferStatus::Initiated if transfer.initiated_and_released() => {
+                self.settle_released_batch(txn, transfer)
+            }
             TransferStatus::WaitingCounterparty => {
                 if self.get_hub_fail_status(transfer.idx)? {
                     return Ok(Some(self.fail_batch_transfer(txn, transfer)?));
@@ -5315,7 +5347,9 @@ pub trait WalletOnline: WalletOffline {
                 .batch_transfers
                 .retain(|t| batch_transfers_ids.contains(&t.idx));
         };
-        db_data.batch_transfers.retain(|t| t.waiting());
+        db_data
+            .batch_transfers
+            .retain(|t| t.waiting() || t.initiated_and_released());
 
         let mut refresh_result = HashMap::new();
         for transfer in &db_data.batch_transfers {
@@ -9130,6 +9164,7 @@ mod tests {
             operation_secret_key: None,
             broadcast_deadline,
             retention_deadline: None,
+            tx_released: false,
         }
     }
 

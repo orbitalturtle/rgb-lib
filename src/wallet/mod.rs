@@ -99,6 +99,9 @@ pub(crate) static CONSIGNMENT_FILE: LazyLock<String> =
     LazyLock::new(|| format!("consignment_out.{RGB_BIN_EXTENSION}"));
 pub(crate) const FASCIA_FILE: &str = "fascia";
 pub(crate) const UNSIGNED_PSBT_FILE: &str = "unsigned.psbt";
+/// Signed TX of an outgoing transfer, saved to broadcast it once the transfer is accepted
+#[cfg(feature = "_online")]
+pub(crate) const SIGNED_TX_FILE: &str = "signed.tx";
 
 /// Maximum time in the future, in seconds, an expiration can be set to, both for an invoice and
 /// for an outgoing operation: about 10 years. A later one is refused with

@@ -1325,3 +1325,120 @@ fn list_asset_media_fail() {
     let result = party.wallet.list_asset_media(unknown_asset_id);
     assert!(matches!(result, Err(Error::AssetNotFound { asset_id: _ })));
 }
+
+/// Once the consignments of a donation carry its signed TX, the transfer can't be failed while the
+/// TX can still confirm, and it's completed if somebody else broadcasts it.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn create_consignments_released() {
+    initialize();
+
+    let mut rcv_party = get_funded_party!();
+    // begin a donation, returning its batch transfer idx, the signed PSBT and its TX
+    let mut begin = |party: &mut SinglesigParty| {
+        let asset = party.issue_asset_nia(None);
+        let receive_data = rcv_party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![blind_recipient(&receive_data, Assignment::Fungible(10))],
+        )]);
+        let begin = party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map,
+                true,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                default_send_expiration(),
+                Some(PROXY_ENDPOINT.clone()),
+                false,
+            )
+            .unwrap();
+        let signed_psbt = party.wallet.sign_psbt(begin.psbt.clone(), None).unwrap();
+        let tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+        let idx = begin.batch_transfer_idx.unwrap();
+        (asset.asset_id, idx, begin.psbt, signed_psbt, tx)
+    };
+    let status = |party: &SinglesigParty, idx| party.db_batch_transfer(idx).status;
+
+    // not released: consignments with the unsigned TX don't prevent failing the transfer
+    let mut party = get_funded_party!();
+    let (_, idx, psbt, _, _) = begin(&mut party);
+    party.wallet.create_consignments(psbt).unwrap();
+    assert!(party.fail_transfers_single(idx));
+    assert_eq!(status(&party, idx), TransferStatus::Failed);
+
+    // released: the fail is denied and nothing changes until the TX is on-chain
+    let mut party = get_funded_party!();
+    let (asset_id, idx, _, signed_psbt, tx) = begin(&mut party);
+    party.wallet.create_consignments(signed_psbt).unwrap();
+    assert!(party.db_batch_transfer(idx).tx_released);
+    assert_matches!(
+        party.fail_transfers(Some(idx), false, false),
+        Err(Error::CannotFailBatchTransfer)
+    );
+    party.refresh_all();
+    assert_eq!(status(&party, idx), TransferStatus::Initiated);
+    // somebody else broadcasts the TX
+    party.wallet.indexer().broadcast(&tx).unwrap();
+    assert!(wait_for_function(
+        || {
+            party.refresh_all();
+            status(&party, idx) == TransferStatus::WaitingConfirmations
+        },
+        30,
+        500
+    ));
+    mine(false);
+    assert!(wait_for_function(
+        || {
+            party.refresh_all();
+            status(&party, idx) == TransferStatus::Settled
+        },
+        30,
+        500
+    ));
+    // the RGB change is tracked
+    assert_eq!(party.get_asset_balance(&asset_id).settled, AMOUNT - 10);
+
+    // released: the send can still be ended
+    let mut party = get_funded_party!();
+    let (_, idx, _, signed_psbt, _) = begin(&mut party);
+    party
+        .wallet
+        .create_consignments(signed_psbt.clone())
+        .unwrap();
+    party.wallet.send_end(party.online, signed_psbt).unwrap();
+    assert_eq!(status(&party, idx), TransferStatus::WaitingConfirmations);
+
+    // released: the transfer fails once its TX can no longer confirm
+    let mut party = get_funded_party!();
+    let (_, idx, _, signed_psbt, tx) = begin(&mut party);
+    party.wallet.create_consignments(signed_psbt).unwrap();
+    let address = BdkAddress::from_str(&party.get_address()).unwrap();
+    let mut tx_builder = party.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .add_utxo(tx.input[0].previous_output)
+        .unwrap()
+        .manually_selected_only()
+        .drain_to(address.assume_checked().script_pubkey())
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let psbt = tx_builder.finish().unwrap();
+    let signed_psbt = party.wallet.sign_psbt(psbt.to_string(), None).unwrap();
+    let other_tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+    party.wallet.broadcast_tx(other_tx).unwrap();
+    party.refresh_all();
+    assert_eq!(status(&party, idx), TransferStatus::Initiated);
+    mine(false);
+    assert!(wait_for_function(
+        || {
+            party.list_unspents_with_sync(false);
+            party.refresh_all();
+            status(&party, idx) == TransferStatus::Failed
+        },
+        30,
+        500
+    ));
+}
