@@ -1,7 +1,8 @@
 //! Silent payments (BIP352) functionality, experimental and limited to regtest.
 //!
 //! This module defines the wallet methods to send RGB assets to a silent payment recipient and to
-//! receive them. The received outputs cannot be spent yet. The
+//! receive them. The received outputs are then spent by the other operations, as other ones holding
+//! the assets are, with their tweak in the PSBT (BIP376). The
 //! proof is expected to reach the recipient by means of the application, which can encrypt it with
 //! keys derived from the shared secret.
 //!
@@ -9,16 +10,18 @@
 //! secret: that is computed here, refusing it if it doesn't yield the same output.
 
 use bdk_wallet::bitcoin::{
-    CompressedPublicKey, EcdsaSighashType,
+    CompressedPublicKey, EcdsaSighashType, Witness,
     hashes::{Hash, HashEngine, sha256},
     key::{Keypair, Parity, TapTweak, TweakedPublicKey},
     secp256k1::{PublicKey, Scalar, SecretKey, XOnlyPublicKey, ecdh::shared_secret_point},
+    sighash::{Prevouts, SighashCache, TapSighashType},
 };
 use bitcoin_silent_payments::{
     LexMin, compat_v32::create_prevouts_summary_32, receive::SpRx, send::SpGroup,
 };
 
 use super::*;
+use crate::wallet::utils::PSBT_IN_SP_TWEAK;
 
 /// The public keys of a silent payment recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,8 +182,32 @@ fn sender_derive(inputs: &[SpInput], pubkeys: &SilentPaymentPubkeys) -> Result<S
     Ok(output)
 }
 
+/// The key pair spending the silent payment output a PSBT input is for, `None` if it isn't.
+fn silent_payment_keypair(
+    input: &bitcoin::psbt::Input,
+    spend_key: &SecretKey,
+) -> Result<Option<Keypair>, Error> {
+    let Some(tweak) = input.unknown.get(&PSBT_IN_SP_TWEAK) else {
+        return Ok(None);
+    };
+    let tweak = SecretKey::from_slice(tweak).map_err(sp_error)?;
+    let key = spend_key.add_tweak(&tweak.into()).map_err(sp_error)?;
+    let keypair = Keypair::from_secret_key(&Secp256k1::new(), &key);
+    let script = ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(
+        keypair.x_only_public_key().0,
+    ));
+    if input.witness_utxo.as_ref().map(|o| &o.script_pubkey) != Some(&script) {
+        return Err(sp_error("input tweak mismatch"));
+    }
+    Ok(Some(keypair))
+}
+
 /// The inputs of a PSBT, all of which need to be P2WPKH or P2TR (key path) ones of this wallet.
-fn psbt_inputs(psbt: &Psbt, master_xprv: &Xpriv) -> Result<Vec<SpInput>, Error> {
+fn psbt_inputs(
+    psbt: &Psbt,
+    master_xprv: &Xpriv,
+    spend_key: &SecretKey,
+) -> Result<Vec<SpInput>, Error> {
     let secp = Secp256k1::new();
     let fingerprint = master_xprv.fingerprint(&secp);
     let derive = |source: &KeySource| -> Result<SecretKey, Error> {
@@ -191,6 +218,14 @@ fn psbt_inputs(psbt: &Psbt, master_xprv: &Xpriv) -> Result<Vec<SpInput>, Error> 
     };
     let mut inputs = vec![];
     for (txin, input) in psbt.unsigned_tx.input.iter().zip(&psbt.inputs) {
+        if let Some(keypair) = silent_payment_keypair(input, spend_key)? {
+            inputs.push(SpInput {
+                outpoint: txin.previous_output,
+                secret_key: keypair.secret_key(),
+                taproot: true,
+            });
+            continue;
+        }
         let script = &input
             .witness_utxo
             .as_ref()
@@ -376,6 +411,44 @@ impl Wallet {
         Ok((derive(1)?, derive(0)?))
     }
 
+    /// Sign and finalize the inputs of a PSBT spending silent payment outputs of this wallet.
+    pub(crate) fn sign_silent_payment_inputs(&self, psbt: &mut Psbt) -> Result<(), Error> {
+        if self.check_silent_payments().is_err()
+            || !psbt
+                .inputs
+                .iter()
+                .any(|i| i.unknown.contains_key(&PSBT_IN_SP_TWEAK))
+        {
+            return Ok(());
+        }
+        let (_, spend_key) = self.silent_payment_keys()?;
+        let prevouts: Vec<TxOut> = psbt
+            .iter_funding_utxos()
+            .map(|o| o.cloned())
+            .collect::<Result<_, _>>()
+            .map_err(sp_error)?;
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        for (index, input) in psbt.inputs.iter_mut().enumerate() {
+            if input.final_script_witness.is_some() {
+                continue;
+            }
+            let Some(keypair) = silent_payment_keypair(input, &spend_key)? else {
+                continue;
+            };
+            let sighash = cache
+                .taproot_key_spend_signature_hash(
+                    index,
+                    &Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .map_err(sp_error)?;
+            let signature = Secp256k1::new().sign_schnorr(&sighash.into(), &keypair);
+            input.final_script_witness = Some(Witness::from_slice(&[signature.as_ref()]));
+            input.unknown.remove(&PSBT_IN_SP_TWEAK);
+        }
+        Ok(())
+    }
+
     /// Return the public keys others can send RGB assets to with
     /// [`send_begin_silent_payment`](Wallet::send_begin_silent_payment).
     ///
@@ -440,7 +513,7 @@ impl Wallet {
     /// to pay exactly `amount` of the asset to the output, otherwise nothing is saved. The transfer
     /// is then settled by [`refresh`](Wallet::refresh).
     ///
-    /// The received assets can't be spent yet. Seed and chain are enough to find the output again
+    /// Seed and chain are enough to find the output again
     /// but not the assets, which are in the backup of the wallet.
     ///
     /// Receiving the same output again has no effect.
@@ -568,7 +641,22 @@ impl Wallet {
         if received != amount {
             return Err(Error::InvalidConsignment);
         }
-        txn.set_silent_payment_output(&outpoint, &output.tweak.secret_bytes(), batch_transfer_idx)?;
+        // the TXO has no amount, as BDK doesn't know about it
+        txn.set_txo(DbTxoActMod {
+            txid: ActiveValue::Set(outpoint.txid.clone()),
+            vout: ActiveValue::Set(outpoint.vout),
+            btc_amount: ActiveValue::Set(payment.amount_sat.to_string()),
+            spent: ActiveValue::Set(false),
+            exists: ActiveValue::Set(false),
+            pending_witness: ActiveValue::Set(true),
+            ..Default::default()
+        })?;
+        txn.set_silent_payment_output(
+            &outpoint,
+            &output.tweak.secret_bytes(),
+            &bitcoin::consensus::encode::serialize(tx),
+            batch_transfer_idx,
+        )?;
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Receive silent payment completed");
@@ -601,8 +689,10 @@ impl Wallet {
         self.check_silent_payments()?;
         self.check_online(online)?;
         let master_xprv = self.master_xprv()?;
+        let (_, spend_key) = self.silent_payment_keys()?;
         let pubkeys = recipient.pubkeys;
-        let derive = |psbt: &Psbt| sender_derive(&psbt_inputs(psbt, &master_xprv)?, &pubkeys);
+        let derive =
+            |psbt: &Psbt| sender_derive(&psbt_inputs(psbt, &master_xprv, &spend_key)?, &pubkeys);
 
         // replaced once the inputs are final
         let placeholder: [u8; 32] = rand::random();

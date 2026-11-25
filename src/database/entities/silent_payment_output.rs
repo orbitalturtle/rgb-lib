@@ -16,6 +16,7 @@ pub struct Model {
     pub idx: i32,
     pub outpoint: String,
     pub tweak: Vec<u8>,
+    pub tx: Vec<u8>,
     pub batch_transfer_idx: i32,
 }
 
@@ -24,6 +25,7 @@ pub enum Column {
     Idx,
     Outpoint,
     Tweak,
+    Tx,
     BatchTransferIdx,
 }
 
@@ -49,6 +51,7 @@ impl ColumnTrait for Column {
             Self::Idx => ColumnType::Integer.def(),
             Self::Outpoint => ColumnType::String(StringLen::None).def().unique(),
             Self::Tweak => ColumnType::Blob.def(),
+            Self::Tx => ColumnType::Blob.def(),
             Self::BatchTransferIdx => ColumnType::Integer.def(),
         }
     }

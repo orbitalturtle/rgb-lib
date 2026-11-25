@@ -332,6 +332,9 @@ impl Wallet {
         psbt: &mut Psbt,
         sign_options: Option<SignOptions>,
     ) -> Result<(), Error> {
+        // first, as BDK only skips the inputs it doesn't know about if final
+        #[cfg(all(feature = "silent_payments", feature = "_online"))]
+        self.sign_silent_payment_inputs(psbt)?;
         let sign_options = sign_options.unwrap_or_default();
         let [colored, vanilla] = &self.signers;
         self.bdk_wallet()

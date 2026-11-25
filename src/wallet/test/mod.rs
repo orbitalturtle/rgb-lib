@@ -432,11 +432,12 @@ pub fn mock_token_data(token_data: TokenData) -> TokenData {
 #[cfg(feature = "_online")]
 pub fn mock_input_unspents<W: WalletOnline + ?Sized>(
     wallet: &W,
+    txn: &DbTxn,
     unspents: &[LocalUnspent],
 ) -> Vec<LocalUnspent> {
     MOCK_INPUT_UNSPENTS.with_borrow_mut(|v| {
         if v.is_empty() {
-            wallet.get_input_unspents(unspents).unwrap()
+            wallet.get_input_unspents(txn, unspents).unwrap()
         } else {
             println!("mocking input unspents");
             std::mem::take(v)

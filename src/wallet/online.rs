@@ -2,7 +2,7 @@
 //!
 //! This module defines the online wallet methods.
 
-use super::*;
+use super::{objects::ForeignOutput, utils::PSBT_IN_SP_TWEAK, *};
 
 /// Signed PSBT of an outgoing transfer, saved instead of its TX by previous versions
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
@@ -398,6 +398,26 @@ impl ResolveRejectList for WalletRejectListResolver<'_> {
         }
         Ok(reject_list)
     }
+}
+
+/// The weight of the witness of a taproot key path spend (with a default sighash).
+const TAPROOT_KEY_SPEND_WEIGHT: bitcoin::Weight = bitcoin::Weight::from_wu(66);
+
+/// The PSBT input spending a foreign output, carrying its tweak (BIP376).
+fn foreign_psbt_input(
+    outpoint: BdkOutPoint,
+    foreign: &ForeignOutput,
+) -> Result<bitcoin::psbt::Input, Error> {
+    let tx: BdkTransaction = bitcoin::consensus::encode::deserialize(&foreign.tx)
+        .map_err(|_| InternalError::Unexpected)?;
+    let witness_utxo = tx.output.get(outpoint.vout as usize).cloned();
+    Ok(bitcoin::psbt::Input {
+        witness_utxo: Some(witness_utxo.ok_or(InternalError::Unexpected)?),
+        // BDK refuses to sign without it
+        non_witness_utxo: Some(tx),
+        unknown: BTreeMap::from([(PSBT_IN_SP_TWEAK, foreign.tweak.clone())]),
+        ..Default::default()
+    })
 }
 
 pub trait WalletOnline: WalletOffline {
@@ -5589,6 +5609,7 @@ pub trait WalletOnline: WalletOffline {
 
     fn prepare_psbt(
         &mut self,
+        txn: &DbTxn,
         input_outpoints: HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
@@ -5597,11 +5618,24 @@ pub trait WalletOnline: WalletOffline {
         // the order of the set is random: sort it so the same inputs give the same TX
         let mut input_outpoints: Vec<BdkOutPoint> = input_outpoints.into_iter().collect();
         input_outpoints.sort_unstable();
+        let foreign_outputs = txn.get_foreign_outputs()?;
         let mut builder = self.bdk_wallet_mut().build_tx();
+        for outpoint in input_outpoints {
+            match foreign_outputs.get(&outpoint.into()) {
+                Some(foreign) => builder
+                    .add_foreign_utxo(
+                        outpoint,
+                        foreign_psbt_input(outpoint, foreign)?,
+                        TAPROOT_KEY_SPEND_WEIGHT,
+                    )
+                    .map_err(|e| Error::Internal {
+                        details: e.to_string(),
+                    })?,
+                None => builder.add_utxo(outpoint).map_err(InternalError::from)?,
+            };
+        }
         builder
             .add_data(&[0; 32])
-            .add_utxos(&input_outpoints)
-            .map_err(InternalError::from)?
             .manually_selected_only()
             .fee_rate(fee_rate)
             .ordering(bdk_wallet::tx_builder::TxOrdering::Untouched);
@@ -5643,13 +5677,14 @@ pub trait WalletOnline: WalletOffline {
 
     fn try_prepare_psbt(
         &mut self,
+        txn: &DbTxn,
         input_unspents: &[LocalUnspent],
         all_inputs: &mut HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         Ok(loop {
-            break match self.prepare_psbt(all_inputs.clone(), witness_recipients, fee_rate) {
+            break match self.prepare_psbt(txn, all_inputs.clone(), witness_recipients, fee_rate) {
                 Ok(res) => res,
                 Err(Error::InsufficientBitcoins { .. }) => {
                     let used_txos: Vec<Outpoint> =
@@ -7038,14 +7073,19 @@ pub trait WalletOnline: WalletOffline {
         }
     }
 
-    fn get_input_unspents(&self, unspents: &[LocalUnspent]) -> Result<Vec<LocalUnspent>, Error> {
+    fn get_input_unspents(
+        &self,
+        txn: &DbTxn,
+        unspents: &[LocalUnspent],
+    ) -> Result<Vec<LocalUnspent>, Error> {
         let mut input_unspents = unspents.to_vec();
         // consider the following UTXOs unspendable:
         // - incoming and pending
         // - outgoing and in initiated or waiting counterparty status
         // - pending incoming witness
         // - pending incoming blinded
-        // - inexistent
+        // - inexistent, unless foreign
+        let foreign = txn.get_foreign_outputs()?;
         input_unspents.retain(|u| {
             !(u.rgb_allocations
                 .iter()
@@ -7055,7 +7095,7 @@ pub trait WalletOnline: WalletOffline {
                 }))
                 && !u.utxo.pending_witness
                 && u.pending_blinded == 0
-                && u.utxo.exists
+                && (u.utxo.exists || foreign.contains_key(&u.utxo.outpoint()))
         });
         Ok(input_unspents)
     }
@@ -7094,9 +7134,9 @@ pub trait WalletOnline: WalletOffline {
         unspents.retain(|u| !reserved.contains(&u.utxo.outpoint()));
 
         #[cfg(test)]
-        let input_unspents = mock_input_unspents(self, &unspents);
+        let input_unspents = mock_input_unspents(self, txn, &unspents);
         #[cfg(not(test))]
-        let input_unspents = self.get_input_unspents(&unspents)?;
+        let input_unspents = self.get_input_unspents(txn, &unspents)?;
 
         let stock = self.rgb_stock(txn)?;
 
@@ -7463,6 +7503,7 @@ pub trait WalletOnline: WalletOffline {
             })
             .collect();
         let (mut psbt, btc_change) = self.try_prepare_psbt(
+            txn,
             input_unspents,
             &mut all_inputs,
             witness_recipients,

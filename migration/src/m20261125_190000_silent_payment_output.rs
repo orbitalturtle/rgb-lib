@@ -1,5 +1,5 @@
 //! Add the `silent_payment_output` table, holding the received silent payment (BIP352) outputs with
-//! the tweak needed to spend them.
+//! the tweak and the TX needed to spend them.
 
 use sea_orm_migration::{prelude::*, schema::*};
 
@@ -17,6 +17,7 @@ impl MigrationTrait for Migration {
                     .col(pk_auto(SilentPaymentOutput::Idx))
                     .col(string_uniq(SilentPaymentOutput::Outpoint))
                     .col(blob(SilentPaymentOutput::Tweak))
+                    .col(blob(SilentPaymentOutput::Tx))
                     .col(integer(SilentPaymentOutput::BatchTransferIdx))
                     .to_owned(),
             )
@@ -36,5 +37,6 @@ enum SilentPaymentOutput {
     Idx,
     Outpoint,
     Tweak,
+    Tx,
     BatchTransferIdx,
 }

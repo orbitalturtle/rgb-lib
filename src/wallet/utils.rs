@@ -20,6 +20,12 @@ pub(crate) const RGB_RUNTIME_DELETING_DIR: &str = "rgb.deleting";
 pub(crate) const LOG_FILE: &str = "log";
 
 pub(crate) const PURPOSE: u8 = 86;
+/// The `PSBT_IN_SP_TWEAK` field (BIP376), with no key data
+#[cfg(feature = "_online")]
+pub(crate) const PSBT_IN_SP_TWEAK: bitcoin::psbt::raw::Key = bitcoin::psbt::raw::Key {
+    type_value: 0x20,
+    key: vec![],
+};
 pub(crate) const COIN_RGB_MAINNET: u32 = 827166;
 pub(crate) const COIN_RGB_TESTNET: u32 = 827167;
 pub(crate) const ACCOUNT: u8 = 0;
