@@ -48,7 +48,8 @@ int main(int argc, char *argv[]) {
     const char *wallet_data =
         "{ \"data_dir\": \"./data\", \"bitcoin_network\": \"Regtest\", "
         "\"database_type\": \"Sqlite\", \"max_allocations_per_utxo\": \"1\", "
-        "\"supported_schemas\": [\"Nia\", \"Cfa\", \"Uda\"] }";
+        "\"supported_schemas\": [\"Nia\", \"Cfa\", \"Uda\"], "
+        "\"allow_reckless_schemas\": false }";
     char keys_data[600];
     sprintf(keys_data,
             "{ \"account_xpub_vanilla\": \"%s\", "
@@ -98,8 +99,11 @@ int main(int argc, char *argv[]) {
 
     printf("Wallet is going online...\n");
     const char *online_options =
-        "{ \"indexer_url\": \"tcp://localhost:50001\", "
-        "\"skip_consistency_check\": false, \"vanilla_sync_lookback\": 20 }";
+        "{ \"indexer_config\": { \"Electrum\": { \"url\": "
+        "\"tcp://localhost:50001\" } }, "
+        "\"skip_consistency_check\": false, \"vanilla_sync_lookback\": 20, "
+        "\"failed_witness_receive_grace_secs\": 604800, "
+        "\"proxy_auth_keys\": {}, \"evm_chains\": {} }";
     CResultString online_res = rgblib_go_online(wlt, online_options);
     if (online_res.result == Err) {
         printf("ERR: %s\n", online_res.inner);
@@ -174,11 +178,13 @@ int main(int argc, char *argv[]) {
     printf("Assets: %s\n", assets_2);
 
     const char *assignment = "{\"Fungible\":77}";
+    const char *receive_amount_policy = "\"Exact\"";
     const char *transport_endpoints = "[\"rpc://127.0.0.1:3000/json-rpc\"]";
     char expiration_timestamp[32];
     sprintf(expiration_timestamp, "%lld", (long long)time(NULL) + 86400);
     CResultString receive_data_res = rgblib_blind_receive(
-        wlt, NULL, assignment, expiration_timestamp, transport_endpoints, "1");
+        wlt, online, NULL, assignment, receive_amount_policy,
+        expiration_timestamp, transport_endpoints, "1", NULL, NULL);
     if (receive_data_res.result == Ok) {
         printf("Receive data: %s\n", receive_data_res.inner);
     } else {

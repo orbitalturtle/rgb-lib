@@ -15,6 +15,9 @@ fn success() {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: vec![AssetSchema::Nia, AssetSchema::Cfa],
+        allow_reckless_schemas: false,
+        address_reuse_vanilla: true,
+        address_reuse_colored_auto: true,
     };
     let wallet_keys = SinglesigKeys::from_keys(&keys, Some(2));
     let wallet = Wallet::new(wallet_data.clone(), wallet_keys.clone()).unwrap();
@@ -42,6 +45,18 @@ fn success() {
         wallet_data.max_allocations_per_utxo
     );
     assert_eq!(loaded_data.supported_schemas, wallet_data.supported_schemas);
+    assert_eq!(
+        loaded_data.allow_reckless_schemas,
+        wallet_data.allow_reckless_schemas
+    );
+    assert_eq!(
+        loaded_data.address_reuse_vanilla,
+        wallet_data.address_reuse_vanilla
+    );
+    assert_eq!(
+        loaded_data.address_reuse_colored_auto,
+        wallet_data.address_reuse_colored_auto
+    );
 
     let loaded_keys = loaded.get_keys();
     assert_eq!(loaded_keys.account_xpub_vanilla, keys.account_xpub_vanilla);
@@ -90,6 +105,9 @@ fn new_updates_manifest_success() {
         database_type: DatabaseType::Sqlite,
         max_allocations_per_utxo: 1,
         supported_schemas: vec![AssetSchema::Nia],
+        allow_reckless_schemas: false,
+        address_reuse_vanilla: false,
+        address_reuse_colored_auto: false,
     };
     let wallet = Wallet::new(wallet_data.clone(), SinglesigKeys::from_keys(&keys, None)).unwrap();
     drop(wallet);
@@ -224,6 +242,27 @@ fn new_immutable_settings_fail() {
     );
     assert_matches!(err, Error::WalletSettingMismatch { setting, .. } if setting == "vanilla_keychain");
 
+    // address reuse can only be turned on when the wallet is created
+    let err = new_with(
+        WalletData {
+            address_reuse_vanilla: true,
+            ..wallet_data.clone()
+        },
+        wallet_keys.clone(),
+    );
+    assert_matches!(err, Error::WalletSettingMismatch { setting, .. } if setting == "address_reuse_vanilla");
+    let err = new_with(
+        WalletData {
+            address_reuse_colored_auto: true,
+            ..wallet_data.clone()
+        },
+        wallet_keys.clone(),
+    );
+    assert_matches!(
+        err,
+        Error::WalletSettingMismatch { setting, .. } if setting == "address_reuse_colored_auto"
+    );
+
     // a rejected new leaves the recorded settings untouched
     let loaded = Wallet::load(
         &test_data_dir_str,
@@ -251,6 +290,76 @@ fn new_immutable_settings_fail() {
     )
     .unwrap();
     Wallet::new(wallet_data.clone(), wallet_keys.clone()).unwrap();
+}
+
+#[test]
+#[parallel]
+fn new_address_reuse_fail() {
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet_keys = SinglesigKeys::from_keys(&keys, None);
+    let with_setting = |wallet_data: &WalletData, setting: &str, value: bool| -> WalletData {
+        let mut wallet_data = wallet_data.clone();
+        match setting {
+            "address_reuse_vanilla" => wallet_data.address_reuse_vanilla = value,
+            "address_reuse_colored_auto" => wallet_data.address_reuse_colored_auto = value,
+            _ => unreachable!(),
+        }
+        wallet_data
+    };
+
+    for setting in ["address_reuse_vanilla", "address_reuse_colored_auto"] {
+        // a new wallet can turn the setting on, which it's then created with
+        let test_data_dir = PrivateDataDir::new();
+        let test_data_dir_str = test_data_dir.string();
+        let wallet_data = get_test_wallet_data(&test_data_dir_str);
+        let reusing_wallet_data = with_setting(&wallet_data, setting, true);
+        let wallet = Wallet::new(reusing_wallet_data.clone(), wallet_keys.clone()).unwrap();
+        drop(wallet);
+        let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
+        assert_eq!(
+            reuse_settings(&loaded),
+            reuse_settings_of(&reusing_wallet_data)
+        );
+        drop(loaded);
+
+        // it can't turn it off then
+        let err = Wallet::new(wallet_data.clone(), wallet_keys.clone())
+            .err()
+            .unwrap();
+        assert_matches!(err, Error::WalletSettingMismatch { setting: s, .. } if s == setting);
+
+        // an existing wallet from before manifest support was created without it, so it can't turn
+        // it on, even if it has used no address
+        let test_data_dir = PrivateDataDir::new();
+        let test_data_dir_str = test_data_dir.string();
+        let wallet_data = get_test_wallet_data(&test_data_dir_str);
+        let wallet = Wallet::new(wallet_data.clone(), wallet_keys.clone()).unwrap();
+        let wallet_dir = wallet.get_wallet_dir();
+        drop(wallet);
+        fs::remove_file(wallet_dir.join(WALLET_MANIFEST_FILE)).unwrap();
+        let err = Wallet::new(
+            with_setting(&wallet_data, setting, true),
+            wallet_keys.clone(),
+        )
+        .err()
+        .unwrap();
+        assert_matches!(err, Error::WalletSettingMismatch { setting: s, .. } if s == setting);
+        // it still opens without it, recording it as off
+        Wallet::new(wallet_data.clone(), wallet_keys.clone()).unwrap();
+        let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
+        assert_eq!(reuse_settings(&loaded), (false, false));
+    }
+}
+
+fn reuse_settings_of(wallet_data: &WalletData) -> (bool, bool) {
+    (
+        wallet_data.address_reuse_vanilla,
+        wallet_data.address_reuse_colored_auto,
+    )
+}
+
+fn reuse_settings(wallet: &Wallet) -> (bool, bool) {
+    reuse_settings_of(&wallet.get_wallet_data())
 }
 
 #[test]
@@ -475,4 +584,36 @@ fn manifest_fingerprint_mismatch_fail() {
         .err()
         .unwrap();
     assert_matches!(err, Error::FingerprintMismatch);
+}
+
+// Manifests written before a setting existed don't carry it, so loading one has to fall back to
+// the behavior the wallet was created with instead of failing to read the manifest.
+#[test]
+#[parallel]
+fn manifest_without_optional_settings_success() {
+    let test_data_dir = PrivateDataDir::new();
+    let test_data_dir_str = test_data_dir.string();
+
+    let keys = generate_keys(BitcoinNetwork::Regtest, WitnessVersion::Taproot);
+    let wallet = Wallet::new(
+        get_test_wallet_data(&test_data_dir_str),
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let manifest_path = wallet.get_wallet_dir().join(WALLET_MANIFEST_FILE);
+    drop(wallet);
+
+    let mut manifest: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert!(
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_reckless_schemas")
+            .is_some()
+    );
+    fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+    let loaded = Wallet::load(&test_data_dir_str, &keys.master_fingerprint, None).unwrap();
+    assert!(!loaded.get_wallet_data().allow_reckless_schemas);
 }

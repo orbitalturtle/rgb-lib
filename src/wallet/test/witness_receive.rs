@@ -16,11 +16,16 @@ fn success() {
     let receive_data = party
         .wallet
         .witness_receive(
+            Some(party.online),
             None,
             Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
             expiration_timestamp,
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
         )
         .unwrap();
     let bak_info_after = party.db_backup_info();
@@ -43,11 +48,16 @@ fn success() {
     let receive_data = party
         .wallet
         .witness_receive(
+            Some(party.online),
             Some(asset_id.clone()),
             Assignment::Fungible(amount),
+            ReceiveAmountPolicy::Whatever,
             expiration_timestamp,
             TRANSPORT_ENDPOINTS.clone(),
             min_confirmations,
+            None,
+            None,
+            None,
         )
         .unwrap();
     assert_eq!(receive_data.expiration_timestamp, expiration_timestamp);
@@ -86,16 +96,50 @@ fn success() {
         format!("rpc://{}", "127.0.0.1:3002/json-rpc"),
     ];
     let result = party.wallet.witness_receive(
+        Some(party.online),
         None,
         Assignment::Any,
+        ReceiveAmountPolicy::Whatever,
         default_rcv_expiration(),
         transport_endpoints.clone(),
         MIN_CONFIRMATIONS,
+        None,
+        None,
+        None,
     );
     assert!(result.is_ok());
     let transfer = party.get_test_transfer_recipient(&result.unwrap().recipient_id);
     let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
     assert_eq!(tte_data.len(), transport_endpoints.len());
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn schema_assignment_combinations() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    // more UTXOs to have free allocation slots for the issuances
+    party.create_utxos_default();
+
+    check_receive_schema_assignment_combinations(
+        &mut party,
+        |w, online, asset_id, assignment, expiration, endpoints, min_confirmations, encryption| {
+            w.witness_receive(
+                online,
+                asset_id,
+                assignment,
+                ReceiveAmountPolicy::Whatever,
+                expiration,
+                endpoints,
+                min_confirmations,
+                encryption,
+                None,
+                None,
+            )
+        },
+    );
 }
 
 #[test]
@@ -104,15 +148,80 @@ fn fail() {
     let data_dir = PrivateDataDir::new();
     let mut wallet = data_dir.wallet(true, None);
 
-    // 0 expiration
+    // online needed when transport endpoints are provided
     let result = wallet
         .witness_receive(
             None,
+            None,
             Assignment::Any,
-            (now().unix_timestamp() - 1) as u64,
+            ReceiveAmountPolicy::Whatever,
+            (now().unix_timestamp() + 60) as u64,
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+    #[cfg(feature = "_online")]
+    assert_matches!(result, Error::OnlineNeeded);
+    #[cfg(not(feature = "_online"))]
+    assert_matches!(result, Error::Offline);
+
+    // 0 expiration (out-of-band exchange, no online needed)
+    let result = wallet
+        .witness_receive(
+            None,
+            None,
+            Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
+            (now().unix_timestamp() - 1) as u64,
+            vec![],
+            MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
         )
         .unwrap_err();
     assert_matches!(result, Error::InvalidExpiration);
+
+    // expiration too far in the future
+    let result = wallet
+        .witness_receive(
+            None,
+            None,
+            Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
+            (now().unix_timestamp() + i64::from(MAX_EXPIRATION_SECS) + 1) as u64,
+            vec![],
+            MIN_CONFIRMATIONS,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+    assert_matches!(result, Error::InvalidExpiration);
+
+    // receive amount policy requiring an amount, without an amount
+    for (assignment, receive_amount_policy) in [
+        (Assignment::Any, ReceiveAmountPolicy::Exact),
+        (Assignment::Any, ReceiveAmountPolicy::AtLeast),
+        (Assignment::Fungible(0), ReceiveAmountPolicy::Exact),
+    ] {
+        let result = wallet
+            .witness_receive(
+                None,
+                None,
+                assignment,
+                receive_amount_policy,
+                (now().unix_timestamp() + 60) as u64,
+                vec![],
+                MIN_CONFIRMATIONS,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_matches!(result, Error::NoReceiveAmount);
+    }
 }

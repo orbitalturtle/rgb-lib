@@ -303,6 +303,9 @@ pub(super) fn get_test_ms_wallet(keys: &MultisigKeys, dir: String) -> MultisigWa
             database_type: DatabaseType::Sqlite,
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: AssetSchema::VALUES.to_vec(),
+            allow_reckless_schemas: false,
+            address_reuse_vanilla: false,
+            address_reuse_colored_auto: false,
         },
         keys.clone(),
     )
@@ -383,9 +386,19 @@ pub(super) trait MultisigOps: OfflineSigParty {
     }
 
     fn blind_receive(&mut self) -> ReceiveData {
+        self.blind_receive_with_policy(Assignment::Any, ReceiveAmountPolicy::Whatever)
+    }
+
+    fn blind_receive_with_policy(
+        &mut self,
+        assignment: Assignment,
+        receive_amount_policy: ReceiveAmountPolicy,
+    ) -> ReceiveData {
         println!("blind_receive {}", self.data_dir());
         let bt_before = self.bak_ts();
-        let res = self.blind_receive_res().unwrap();
+        let res = self
+            .blind_receive_res_with_policy(assignment, receive_amount_policy)
+            .unwrap();
         assert!(self.bak_ts() > bt_before);
         let op_idx = op_counter_bump();
         println!("initiated blind_receive with operation ID {op_idx}");
@@ -393,14 +406,24 @@ pub(super) trait MultisigOps: OfflineSigParty {
     }
 
     fn blind_receive_res(&mut self) -> Result<ReceiveData, Error> {
+        self.blind_receive_res_with_policy(Assignment::Any, ReceiveAmountPolicy::Whatever)
+    }
+
+    fn blind_receive_res_with_policy(
+        &mut self,
+        assignment: Assignment,
+        receive_amount_policy: ReceiveAmountPolicy,
+    ) -> Result<ReceiveData, Error> {
         let online = self.online();
         self.multisig_mut().blind_receive(
             online,
             None,
-            Assignment::Any,
+            assignment,
+            receive_amount_policy,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
     }
 
@@ -486,20 +509,36 @@ pub(super) trait MultisigOps: OfflineSigParty {
         )
     }
 
-    fn burn_init(&mut self, asset_id: &str, amount: u64) -> InitOperationResult {
+    fn burn_init(
+        &mut self,
+        asset_id: &str,
+        amount: u64,
+        burn_reason: Option<&str>,
+    ) -> InitOperationResult {
         println!("burn init {}", self.data_dir());
         let bt_before = self.bak_ts();
-        let res = self.burn_init_res(asset_id, amount).unwrap();
+        let res = self.burn_init_res(asset_id, amount, burn_reason).unwrap();
         assert_eq!(self.bak_ts(), bt_before);
         op_counter_bump();
         println!("initiated burn with operation ID {}", res.operation_idx);
         res
     }
 
-    fn burn_init_res(&mut self, asset_id: &str, amount: u64) -> Result<InitOperationResult, Error> {
+    fn burn_init_res(
+        &mut self,
+        asset_id: &str,
+        amount: u64,
+        burn_reason: Option<&str>,
+    ) -> Result<InitOperationResult, Error> {
         let online = self.online();
-        self.multisig_mut()
-            .burn_init(online, asset_id.to_string(), amount, FEE_RATE, 1)
+        self.multisig_mut().burn_init(
+            online,
+            asset_id.to_string(),
+            amount,
+            burn_reason.map(str::to_string),
+            FEE_RATE,
+            1,
+        )
     }
 
     fn issue_asset_cfa(&mut self, amounts: Option<&[u64]>, file_path: Option<String>) -> AssetCFA {
@@ -694,6 +733,7 @@ pub(super) trait MultisigOps: OfflineSigParty {
             FEE_RATE,
             1,
             default_send_expiration(),
+            PROXY_ENDPOINT.clone(),
         )
     }
 
@@ -748,9 +788,11 @@ pub(super) trait MultisigOps: OfflineSigParty {
             online,
             None,
             Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
         )
     }
 }
@@ -852,6 +894,7 @@ pub(super) fn issue_asset(
                 .sum::<u64>();
             (IssuedAsset::Ifa(asset), supply, Some(inflation_supply))
         }
+        AssetSchema::Bfa => panic!("multisig wallets cannot issue BFA assets"),
     };
 
     check_issuance(initiator, others, asset.asset_id(), schema);
@@ -951,7 +994,7 @@ fn check_asset_metadata<P: OfflineSigParty<W = MultisigWallet>>(
         assert_eq!(meta.known_circulating_supply, supply);
         assert_eq!(meta.name, name);
         assert_eq!(meta.precision, precision);
-        assert_eq!(meta.reject_list_url, None);
+        assert_eq!(meta.reject_list, None);
         match schema {
             AssetSchema::Cfa => assert_eq!(meta.ticker, None),
             _ => assert_eq!(meta.ticker, Some(TICKER.to_string())),
@@ -1045,7 +1088,7 @@ fn check_asset_metadata<P: OfflineSigParty<W = MultisigWallet>>(
                     token_1 = Some(token.clone());
                 }
             }
-            AssetSchema::Nia | AssetSchema::Ifa => {
+            AssetSchema::Nia | AssetSchema::Ifa | AssetSchema::Bfa => {
                 assert_eq!(meta.token, None);
             }
         }
@@ -1127,6 +1170,13 @@ fn check_issuance(
         let found_ids: Vec<&str> = match schema {
             AssetSchema::Cfa => assets
                 .cfa
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|a| a.asset_id.as_str())
+                .collect(),
+            AssetSchema::Bfa => assets
+                .bfa
                 .as_deref()
                 .unwrap_or_default()
                 .iter()
@@ -1400,12 +1450,31 @@ pub(super) fn inspect_inflate(
     let details = InflateHandler::extract_details(&files).unwrap();
     let rgb_inspection = wallet
         .multisig
-        .inspect_rgb_transfer(psbt.clone(), details.fascia_path, details.entropy)
+        .inspect_fascia(
+            psbt.clone(),
+            details.fascia_path,
+            Some(details.entropy),
+            MAX_FASCIA_SIZE,
+            MAX_FASCIA_BUNDLES,
+        )
         .unwrap();
+    assert_eq!(
+        rgb_inspection.txid,
+        Psbt::from_str(psbt)
+            .unwrap()
+            .unsigned_tx
+            .compute_txid()
+            .to_string()
+    );
     assert_eq!(rgb_inspection.close_method, CloseMethod::OpretFirst);
     assert_eq!(rgb_inspection.operations.len(), 1);
     let ifa_op = &rgb_inspection.operations[0];
     assert_eq!(ifa_op.asset_id, ifa_asset.asset_id);
+    // the fascia built by the wallet includes all the committed transitions
+    assert_eq!(
+        ifa_op.committed_transition_count as usize,
+        ifa_op.transitions.len()
+    );
     let inflate_transitions: Vec<_> = ifa_op
         .transitions
         .iter()
@@ -1423,30 +1492,63 @@ pub(super) fn inspect_inflate(
     let mut sorted_expected = inflation_amounts.to_vec();
     sorted_expected.sort();
     assert_eq!(sorted_inflate_outputs, sorted_expected);
+    assert_eq!(
+        inflate_transitions[0].globals,
+        vec![TransitionGlobal::IssuedSupply(
+            inflation_amounts.iter().sum()
+        )]
+    );
+    // the allowed inflation matches the inflation rights in output
+    let inflation_rights: u64 = inflate_transitions[0]
+        .outputs
+        .iter()
+        .filter_map(|o| match o.assignment {
+            Assignment::InflationRight(amount) => Some(amount),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        inflate_transitions[0].metadata,
+        vec![TransitionMetadata::AllowedInflation(inflation_rights)]
+    );
 }
 
 pub(super) fn inspect_burn(
     wallet: &MultisigParty,
     op_init: &InitOperationResult,
-    ifa_asset: &AssetIFA,
+    asset_id: &str,
+    burn_amount: u64,
+    burn_reason: Option<&str>,
 ) {
     let psbt = &op_init.psbt;
     let (_, files) = wallet.get_op_and_files(op_init.operation_idx);
     let details = BurnHandler::extract_details(&files).unwrap();
+    assert_eq!(details.burn_reason.as_deref(), burn_reason);
     let rgb_inspection = wallet
         .multisig
-        .inspect_rgb_transfer(psbt.clone(), details.fascia_path, details.entropy)
+        .inspect_fascia(
+            psbt.clone(),
+            details.fascia_path,
+            Some(details.entropy),
+            MAX_FASCIA_SIZE,
+            MAX_FASCIA_BUNDLES,
+        )
         .unwrap();
     assert_eq!(rgb_inspection.close_method, CloseMethod::OpretFirst);
     assert_eq!(rgb_inspection.operations.len(), 1);
-    let ifa_op = &rgb_inspection.operations[0];
-    assert_eq!(ifa_op.asset_id, ifa_asset.asset_id);
-    let burn_transitions: Vec<_> = ifa_op
+    let asset_op = &rgb_inspection.operations[0];
+    assert_eq!(asset_op.asset_id, asset_id);
+    let burn_transitions: Vec<_> = asset_op
         .transitions
         .iter()
         .filter(|t| t.r#type == TypeOfTransition::Burn)
         .collect();
     assert_eq!(burn_transitions.len(), 1);
+    let mut expected_globals = vec![TransitionGlobal::BurnedAsset(burn_amount)];
+    if let Some(burn_reason) = burn_reason {
+        expected_globals.push(TransitionGlobal::BurnReason(burn_reason.to_string()));
+    }
+    assert_eq!(burn_transitions[0].globals, expected_globals);
 }
 
 pub(super) fn inspect_send(
@@ -1475,7 +1577,13 @@ pub(super) fn inspect_send(
     let details = SendRgbHandler::extract_details(&files).unwrap();
     let rgb_inspection = wallet
         .multisig
-        .inspect_rgb_transfer(psbt.to_string(), details.fascia_path, details.entropy)
+        .inspect_fascia(
+            psbt.to_string(),
+            details.fascia_path,
+            Some(details.entropy),
+            MAX_FASCIA_SIZE,
+            MAX_FASCIA_BUNDLES,
+        )
         .unwrap();
     assert_eq!(rgb_inspection.close_method, CloseMethod::OpretFirst);
     assert_eq!(rgb_inspection.commitment_hex.len(), 64);
@@ -1501,8 +1609,21 @@ pub(super) fn inspect_send(
         .flat_map(|t| &t.outputs)
         .collect();
     assert_eq!(cfa_outputs.len(), 3);
-    let cfa_sent_outputs: Vec<_> = cfa_outputs.iter().filter(|o| !o.is_ours).collect();
-    let cfa_change_outputs: Vec<_> = cfa_outputs.iter().filter(|o| o.is_ours).collect();
+    assert!(cfa_outputs.iter().all(|o| o.is_terminal.is_none()));
+    assert!(
+        cfa_outputs
+            .iter()
+            .all(|o| o.is_concealed == o.txid.is_none()
+                && o.is_concealed == o.recipient_id.is_some())
+    );
+    let cfa_sent_outputs: Vec<_> = cfa_outputs
+        .iter()
+        .filter(|o| o.is_ours == Some(false))
+        .collect();
+    let cfa_change_outputs: Vec<_> = cfa_outputs
+        .iter()
+        .filter(|o| o.is_ours == Some(true))
+        .collect();
     assert_eq!(cfa_sent_outputs.len(), 2);
     assert_eq!(cfa_change_outputs.len(), 1);
     let cfa_witness_output = cfa_sent_outputs.iter().find(|o| !o.is_concealed).unwrap();
@@ -1511,28 +1632,31 @@ pub(super) fn inspect_send(
         cfa_amount_witness
     );
     assert!(!cfa_witness_output.is_concealed);
-    assert!(!cfa_witness_output.is_ours);
+    assert_eq!(cfa_witness_output.is_ours, Some(false));
     let cfa_blind_output = cfa_sent_outputs.iter().find(|o| o.is_concealed).unwrap();
     assert_eq!(cfa_blind_output.assignment.main_amount(), cfa_amount_blind);
     assert!(cfa_blind_output.is_concealed);
-    assert!(!cfa_blind_output.is_ours);
+    assert_eq!(cfa_blind_output.is_ours, Some(false));
     let cfa_change_amount: u64 = cfa_change_outputs
         .iter()
         .map(|o| o.assignment.main_amount())
         .sum();
     for o in &cfa_change_outputs {
         assert!(!o.is_concealed);
-        assert!(o.is_ours);
+        assert_eq!(o.is_ours, Some(true));
     }
     let cfa_sent_amount = cfa_amount_witness + cfa_amount_blind;
     let total_cfa_output: u64 = cfa_outputs.iter().map(|o| o.assignment.main_amount()).sum();
     assert_eq!(total_cfa_output, cfa_sent_amount + cfa_change_amount);
     assert!(!cfa_inputs.is_empty());
-    let total_cfa_input: u64 = cfa_inputs.iter().map(|i| i.assignment.main_amount()).sum();
+    let total_cfa_input: u64 = cfa_inputs
+        .iter()
+        .map(|i| input_assignment(i).main_amount())
+        .sum();
     assert_eq!(total_cfa_input, total_cfa_output);
     for input in &cfa_inputs {
-        assert!((input.vin as usize) < psbt_info.inputs.len());
-        assert_matches!(input.assignment, Assignment::Fungible(_));
+        assert!((input_vin(input) as usize) < psbt_info.inputs.len());
+        assert_matches!(input.assignment, Some(Assignment::Fungible(_)));
     }
     let nia_inputs: Vec<_> = nia_transfer
         .transitions
@@ -1544,20 +1668,29 @@ pub(super) fn inspect_send(
         .iter()
         .flat_map(|t| &t.outputs)
         .collect();
-    let nia_sent_outputs: Vec<_> = nia_outputs.iter().filter(|o| !o.is_ours).collect();
-    let nia_change_outputs: Vec<_> = nia_outputs.iter().filter(|o| o.is_ours).collect();
+    let nia_sent_outputs: Vec<_> = nia_outputs
+        .iter()
+        .filter(|o| o.is_ours == Some(false))
+        .collect();
+    let nia_change_outputs: Vec<_> = nia_outputs
+        .iter()
+        .filter(|o| o.is_ours == Some(true))
+        .collect();
     assert_eq!(nia_sent_outputs.len(), 1);
     assert!(!nia_change_outputs.is_empty());
     assert_eq!(nia_sent_outputs[0].assignment.main_amount(), AMOUNT_SMALL);
     assert!(nia_sent_outputs[0].is_concealed);
-    assert!(!nia_sent_outputs[0].is_ours);
+    assert_eq!(nia_sent_outputs[0].is_ours, Some(false));
     let total_nia_output: u64 = nia_outputs.iter().map(|o| o.assignment.main_amount()).sum();
-    let total_nia_input: u64 = nia_inputs.iter().map(|i| i.assignment.main_amount()).sum();
+    let total_nia_input: u64 = nia_inputs
+        .iter()
+        .map(|i| input_assignment(i).main_amount())
+        .sum();
     assert_eq!(total_nia_input, total_nia_output);
     assert!(total_nia_input >= AMOUNT_SMALL);
     for input in &nia_inputs {
-        assert!((input.vin as usize) < psbt_info.inputs.len());
-        assert_matches!(input.assignment, Assignment::Fungible(_));
+        assert!((input_vin(input) as usize) < psbt_info.inputs.len());
+        assert_matches!(input.assignment, Some(Assignment::Fungible(_)));
     }
     let nia_2_transfer = rgb_inspection
         .operations
@@ -1575,20 +1708,26 @@ pub(super) fn inspect_send(
         .flat_map(|t| &t.outputs)
         .collect();
     assert_eq!(nia_2_outputs.len(), 2);
-    let nia_2_sent: Vec<_> = nia_2_outputs.iter().filter(|o| !o.is_ours).collect();
-    let nia_2_change: Vec<_> = nia_2_outputs.iter().filter(|o| o.is_ours).collect();
+    let nia_2_sent: Vec<_> = nia_2_outputs
+        .iter()
+        .filter(|o| o.is_ours == Some(false))
+        .collect();
+    let nia_2_change: Vec<_> = nia_2_outputs
+        .iter()
+        .filter(|o| o.is_ours == Some(true))
+        .collect();
     assert_eq!(nia_2_sent.len(), 1);
     assert_eq!(nia_2_change.len(), 1);
     assert_eq!(nia_2_sent[0].assignment.main_amount(), nia_2_amount);
     assert!(nia_2_sent[0].is_concealed);
-    assert!(!nia_2_sent[0].is_ours);
+    assert_eq!(nia_2_sent[0].is_ours, Some(false));
     let expected_nia_2_change = AMOUNT_SMALL - nia_2_amount;
     assert_eq!(
         nia_2_change[0].assignment.main_amount(),
         expected_nia_2_change
     );
     assert!(!nia_2_change[0].is_concealed);
-    assert!(nia_2_change[0].is_ours);
+    assert_eq!(nia_2_change[0].is_ours, Some(true));
     let nia_2_total_output: u64 = nia_2_outputs
         .iter()
         .map(|o| o.assignment.main_amount())
@@ -1597,17 +1736,17 @@ pub(super) fn inspect_send(
     assert!(!nia_2_inputs.is_empty());
     let nia_2_total_input: u64 = nia_2_inputs
         .iter()
-        .map(|i| i.assignment.main_amount())
+        .map(|i| input_assignment(i).main_amount())
         .sum();
     assert_eq!(nia_2_total_input, nia_2_total_output);
     assert_eq!(nia_2_total_input, AMOUNT_SMALL);
     for input in &nia_2_inputs {
-        assert!((input.vin as usize) < psbt_info.inputs.len());
-        assert_matches!(input.assignment, Assignment::Fungible(_));
+        assert!((input_vin(input) as usize) < psbt_info.inputs.len());
+        assert_matches!(input.assignment, Some(Assignment::Fungible(_)));
     }
 }
 
-fn op_counter_bump() -> i32 {
+pub(super) fn op_counter_bump() -> i32 {
     OP_COUNTER.fetch_add(1, Ordering::SeqCst);
     OP_COUNTER.load(Ordering::SeqCst) as i32
 }
@@ -1867,9 +2006,9 @@ pub(super) fn settle_transfer(
     }
     if let Some(psbt) = psbt {
         let txid = Psbt::from_str(psbt).unwrap().get_txid().to_string();
-        mine_tx(false, &txid);
+        mine_tx(&txid);
     } else if let Some(txid) = txid {
-        mine_tx(false, txid);
+        mine_tx(txid);
     } else {
         mine(false);
     }

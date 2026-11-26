@@ -88,6 +88,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -101,6 +104,7 @@ fn success() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
         )
         .unwrap();
@@ -108,8 +112,9 @@ fn success() {
     party.fail_transfers_single(batch_transfer_idx);
     let batch_transfers_before = party.db_batch_transfers();
     assert_eq!(batch_transfers_before.len(), 2);
+    // the bitcoin change is registered even with no RGB change going to it
     let txos_before = party.db_txos();
-    assert_eq!(txos_before.len(), 5);
+    assert_eq!(txos_before.len(), 6);
     let colorings_before = party.db_colorings();
     assert_eq!(colorings_before.len(), 2);
     assert!(party.delete_transfers(Some(batch_transfer_idx), false));
@@ -127,6 +132,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT - 1),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -140,6 +148,7 @@ fn success() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
             false,
         )
         .unwrap();
@@ -164,11 +173,15 @@ fn success() {
     let receive_data_2 = party
         .wallet
         .blind_receive(
+            Some(party.online),
             Some(asset.asset_id),
             Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
         )
         .unwrap();
     assert!(party.fail_transfers_single(receive_data_1.batch_transfer_idx));
@@ -216,12 +229,18 @@ fn batch_success() {
         vec![
             Recipient {
                 recipient_id: receive_data_1.recipient_id.clone(),
+                public_key: Some(receive_data_1.public_key.clone()),
+                expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 assignment: Assignment::Fungible(amount),
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 recipient_id: receive_data_2.recipient_id.clone(),
+                public_key: Some(receive_data_2.public_key.clone()),
+                expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 assignment: Assignment::Fungible(amount),
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
@@ -273,11 +292,15 @@ fn fail() {
     let receive_data = party
         .wallet
         .blind_receive(
+            Some(party.online),
             Some(asset.asset_id),
             Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
             default_rcv_expiration(),
             TRANSPORT_ENDPOINTS.clone(),
             MIN_CONFIRMATIONS,
+            None,
+            None,
         )
         .unwrap();
     party.fail_transfers_all();

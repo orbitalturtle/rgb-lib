@@ -6,7 +6,8 @@ use utils::*;
 
 #[cfg(feature = "electrum")]
 #[test]
-#[serial]
+#[parallel]
+#[serial(hub)]
 fn success() {
     initialize();
     op_counter_reset();
@@ -272,6 +273,27 @@ fn success() {
         unreachable!()
     };
 
+    println!("\n=== export NIA contract (wlt_1) and import it (singlesig) ===");
+    let destination_dir = TempDir::new().unwrap();
+    let contract_path = wlt_1
+        .multisig_ref()
+        .export_contract(
+            nia_asset_1.asset_id.clone(),
+            destination_dir.path().to_string_lossy().to_string(),
+        )
+        .unwrap();
+    let importer = get_test_wallet(true, None);
+    importer.import_contract(contract_path, vec![]).unwrap();
+    assert_eq!(
+        importer
+            .get_asset_metadata(nia_asset_1.asset_id.clone())
+            .unwrap(),
+        wlt_1
+            .multisig_ref()
+            .get_asset_metadata(nia_asset_1.asset_id.clone())
+            .unwrap()
+    );
+
     let mut singlesig_wlt = get_funded_party!();
 
     println!("\n=== send UDA (wlt_1 → singlesig) ===");
@@ -284,6 +306,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::NonFungible,
             recipient_id: rcv_data.recipient_id.clone(),
+            public_key: Some(rcv_data.public_key.clone()),
+            expiration_timestamp: Some(rcv_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: vec![],
         }],
@@ -295,6 +320,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::NonFungible,
             recipient_id: rcv_data.recipient_id.clone(),
+            public_key: Some(rcv_data.public_key.clone()),
+            expiration_timestamp: Some(rcv_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -345,6 +373,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::NonFungible,
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: Some(WitnessData {
                 amount_sat: 1000,
                 blinding: None,
@@ -391,6 +422,9 @@ fn success() {
                 Recipient {
                     assignment: Assignment::Fungible(cfa_amount_witness),
                     recipient_id: rcv_data_1.recipient_id.clone(),
+                    public_key: Some(rcv_data_1.public_key.clone()),
+                    expiration_timestamp: Some(rcv_data_1.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat: 1000,
                         blinding: None,
@@ -400,6 +434,9 @@ fn success() {
                 Recipient {
                     assignment: Assignment::Fungible(cfa_amount_blind),
                     recipient_id: rcv_data_3.recipient_id.clone(),
+                    public_key: Some(rcv_data_3.public_key.clone()),
+                    expiration_timestamp: Some(rcv_data_3.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -410,6 +447,9 @@ fn success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(AMOUNT_SMALL),
                 recipient_id: rcv_data_2.recipient_id.clone(),
+                public_key: Some(rcv_data_2.public_key.clone()),
+                expiration_timestamp: Some(rcv_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -426,13 +466,27 @@ fn success() {
 
     println!("\n=== blind receive new asset (singlesig → wlt_1) ===");
     let nia_asset_2 = singlesig_wlt.issue_asset_nia(None);
-    let receive_data = wlt_1.blind_receive();
+    let receive_data = wlt_1.blind_receive_with_policy(
+        Assignment::Fungible(AMOUNT_SMALL),
+        ReceiveAmountPolicy::Exact,
+    );
     sync_wallets_full(&mut [&mut wlt_2, &mut wlt_3]);
+    // the receive amount policy is propagated to the other cosigners
+    for wlt in [&wlt_1, &wlt_2, &wlt_3] {
+        let transfer = wlt.get_test_transfer_recipient(&receive_data.recipient_id);
+        assert_eq!(
+            transfer.receive_amount_policy,
+            Some(ReceiveAmountPolicy::Exact)
+        );
+    }
     let recipient_map = HashMap::from([(
         nia_asset_2.asset_id.clone(),
         vec![Recipient {
             assignment: Assignment::Fungible(AMOUNT_SMALL),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -487,6 +541,9 @@ fn success() {
                 Recipient {
                     assignment: Assignment::Fungible(cfa_amount_witness),
                     recipient_id: rcv_data_1.recipient_id.clone(),
+                    public_key: Some(rcv_data_1.public_key.clone()),
+                    expiration_timestamp: Some(rcv_data_1.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: Some(WitnessData {
                         amount_sat: 1000,
                         blinding: None,
@@ -496,6 +553,9 @@ fn success() {
                 Recipient {
                     assignment: Assignment::Fungible(cfa_amount_blind),
                     recipient_id: rcv_data_3.recipient_id.clone(),
+                    public_key: Some(rcv_data_3.public_key.clone()),
+                    expiration_timestamp: Some(rcv_data_3.expiration_timestamp),
+                    encryption: Encryption::Optional,
                     witness_data: None,
                     transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
                 },
@@ -506,6 +566,9 @@ fn success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(AMOUNT_SMALL),
                 recipient_id: rcv_data_2.recipient_id.clone(),
+                public_key: Some(rcv_data_2.public_key.clone()),
+                expiration_timestamp: Some(rcv_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -515,6 +578,9 @@ fn success() {
             vec![Recipient {
                 assignment: Assignment::Fungible(nia_2_amount),
                 recipient_id: rcv_data_4.recipient_id.clone(),
+                public_key: Some(rcv_data_4.public_key.clone()),
+                expiration_timestamp: Some(rcv_data_4.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             }],
@@ -636,6 +702,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::Fungible(10),
             recipient_id: rcv_data.recipient_id.clone(),
+            public_key: Some(rcv_data.public_key.clone()),
+            expiration_timestamp: Some(rcv_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -744,8 +813,14 @@ fn success() {
     println!("\n=== burn (wlt_1) ===");
     check_wallets_up_to_date(&mut [&mut wlt_1, &mut wlt_2, &mut wlt_3]);
     let burn_amount = 50;
-    let op_init = wlt_1.burn_init(&ifa_asset.asset_id, burn_amount);
-    inspect_burn(&wlt_3, &op_init, &ifa_asset);
+    let op_init = wlt_1.burn_init(&ifa_asset.asset_id, burn_amount, Some(BURN_REASON));
+    inspect_burn(
+        &wlt_3,
+        &op_init,
+        &ifa_asset.asset_id,
+        burn_amount,
+        Some(BURN_REASON),
+    );
     operation_complete::<BurnHandler>(
         op_init.operation_idx,
         &mut [&mut wlt_1, &mut wlt_2, &mut wlt_3],
@@ -769,7 +844,8 @@ fn success() {
     );
 
     println!("\n=== burn discarded (wlt_3) ===");
-    let op_init = wlt_3.burn_init(&ifa_asset.asset_id, 1);
+    let op_init = wlt_3.burn_init(&ifa_asset.asset_id, 1, None);
+    inspect_burn(&wlt_1, &op_init, &ifa_asset.asset_id, 1, None);
     operation_complete::<BurnHandler>(
         op_init.operation_idx,
         &mut [],
@@ -800,7 +876,7 @@ fn success() {
     check_btc_balance(
         &mut [&mut wlt_1, &mut wlt_2, &mut wlt_3],
         (0, 6442, 6442),
-        (15366, 15366, 15366),
+        (15452, 15452, 15452),
     );
     drop(_guard);
     // confirm the TX, so the final state checks below don't depend on other tests mining
@@ -808,7 +884,7 @@ fn success() {
         .unwrap()
         .get_txid()
         .to_string();
-    mine_tx(false, &send_btc_txid);
+    mine_tx(&send_btc_txid);
     let op_init_last_successful = op_init;
 
     println!("\n=== receive failed (wlt_1) ===");
@@ -838,6 +914,9 @@ fn success() {
         vec![Recipient {
             assignment: Assignment::Fungible(10),
             recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
@@ -886,7 +965,7 @@ fn success() {
 
     // final state expectations
     let btc_final_vanilla = (6442, 6442, 6442);
-    let btc_final_colored = (15366, 15366, 15366);
+    let btc_final_colored = (15452, 15452, 15452);
     let tx_type_final = TransactionType::SendBtc;
     #[rustfmt::skip]
     let assets_final = HashMap::from([
@@ -963,7 +1042,8 @@ fn success() {
 
 #[cfg(feature = "electrum")]
 #[test]
-#[serial]
+#[parallel]
+#[serial(hub)]
 fn fail() {
     initialize();
     op_counter_reset();
@@ -1075,9 +1155,11 @@ fn fail() {
             wlt_1.online,
             None,
             Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap_err();
     assert_eq!(err, Error::UnsupportedTransportType);
@@ -1087,9 +1169,11 @@ fn fail() {
             wlt_1.online,
             None,
             Assignment::Any,
+            ReceiveAmountPolicy::Whatever,
             default_rcv_expiration(),
             vec![],
             MIN_CONFIRMATIONS,
+            None,
         )
         .unwrap_err();
     assert_eq!(err, Error::UnsupportedTransportType);
@@ -1098,6 +1182,22 @@ fn fail() {
     let invalid_multisig_wlt_keys = MultisigKeys::new(vec![], threshold_colored, threshold_vanilla);
     let res = MultisigWallet::new(get_test_wallet_data(&data_dir), invalid_multisig_wlt_keys);
     assert_eq!(res.err().unwrap(), Error::NoCosignersSupplied);
+
+    // address reuse is not supported
+    for (vanilla, colored) in [(true, false), (false, true)] {
+        let mut wallet_data = get_test_wallet_data(&data_dir);
+        wallet_data.address_reuse_vanilla = vanilla;
+        wallet_data.address_reuse_colored_auto = colored;
+        let multisig_keys =
+            MultisigKeys::new(cosigners.clone(), threshold_colored, threshold_vanilla);
+        let err = MultisigWallet::new(wallet_data, multisig_keys)
+            .err()
+            .unwrap();
+        assert_matches!(
+            err,
+            Error::UnsupportedAddressReuse { details } if details == "multisig wallets don't support it"
+        );
+    }
 
     // invalid thresholds: higher than total cosigners
     let invalid_threshold = num_cosigners + 1;
@@ -1351,7 +1451,8 @@ fn fail() {
 
 #[cfg(feature = "electrum")]
 #[test]
-#[serial]
+#[parallel]
+#[serial(hub)]
 fn offline() {
     initialize();
 
@@ -1401,13 +1502,15 @@ fn offline() {
         fake_online,
         None,
         Assignment::Any,
+        ReceiveAmountPolicy::Whatever,
         default_rcv_expiration(),
         vec![],
         0,
+        None,
     );
     assert_matches!(result, Err(Error::Offline));
 
-    let result = wallet.burn_init(fake_online, "aid".into(), 0, 0, 0);
+    let result = wallet.burn_init(fake_online, "aid".into(), 0, None, 0, 0);
     assert_matches!(result, Err(Error::Offline));
 
     let result = wallet.create_utxos_init(fake_online, false, None, None, 0, false);
@@ -1458,6 +1561,7 @@ fn offline() {
         0,
         0,
         default_send_expiration(),
+        PROXY_ENDPOINT.clone(),
     );
     assert_matches!(result, Err(Error::Offline));
 
@@ -1474,16 +1578,19 @@ fn offline() {
         fake_online,
         None,
         Assignment::Any,
+        ReceiveAmountPolicy::Whatever,
         default_rcv_expiration(),
         vec![],
         0,
+        None,
     );
     assert_matches!(result, Err(Error::Offline));
 }
 
 #[cfg(feature = "electrum")]
 #[test]
-#[serial]
+#[parallel]
+#[serial(hub)]
 fn send_to_oneself() {
     initialize();
     op_counter_reset();
@@ -1675,12 +1782,18 @@ fn send_to_oneself() {
             Recipient {
                 assignment: Assignment::Fungible(20),
                 recipient_id: rcv_data_1.recipient_id.clone(),
+                public_key: Some(rcv_data_1.public_key.clone()),
+                expiration_timestamp: Some(rcv_data_1.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: None,
                 transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             },
             Recipient {
                 assignment: Assignment::Fungible(30),
                 recipient_id: rcv_data_2.recipient_id.clone(),
+                public_key: Some(rcv_data_2.public_key.clone()),
+                expiration_timestamp: Some(rcv_data_2.expiration_timestamp),
+                encryption: Encryption::Optional,
                 witness_data: Some(WitnessData {
                     amount_sat: 1000,
                     blinding: None,
@@ -1689,6 +1802,8 @@ fn send_to_oneself() {
             },
         ],
     )]);
+    // no blocks until the receive transfers have been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let op_init_rgb = wlt_1.send_init(recipient_map);
     operation_complete::<SendRgbHandler>(
         op_init_rgb.operation_idx,
@@ -1715,6 +1830,7 @@ fn send_to_oneself() {
         None,
         TransferStatus::WaitingConfirmations,
     );
+    drop(guard);
     settle_transfer(
         &mut [&mut wlt_1, &mut wlt_2],
         &mut [&mut wlt_3],
@@ -1759,5 +1875,149 @@ fn send_to_oneself() {
         &[&wlt_1, &wlt_2, &wlt_3],
         &nia_asset.asset_id,
         (AMOUNT_SMALL, AMOUNT_SMALL, AMOUNT_SMALL),
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+#[serial(hub)]
+#[serial(evm)]
+fn mint_refused() {
+    initialize();
+    op_counter_reset();
+
+    let bitcoin_network = BitcoinNetwork::Regtest;
+    let threshold_colored = 2;
+    let threshold_vanilla = 2;
+    let random_str: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+
+    // multisig wallet keys
+    let wlt_1_keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
+    let wlt_2_keys = generate_keys(bitcoin_network, WitnessVersion::Taproot);
+
+    // cosigners
+    let cosigners = vec![
+        Cosigner::from_keys(&wlt_1_keys, None),
+        Cosigner::from_keys(&wlt_2_keys, None),
+    ];
+    let cosigner_xpubs: Vec<String> = cosigners
+        .iter()
+        .map(|c| c.account_xpub_colored.clone())
+        .collect();
+
+    // biscuit token setup
+    let root_keypair = KeyPair::new();
+    let root_public_key = root_keypair.public();
+    let mut cosigner_tokens = vec![];
+    for cosigner_xpub in &cosigner_xpubs {
+        cosigner_tokens.push(create_token(
+            &root_keypair,
+            Role::Cosigner(cosigner_xpub.clone()),
+            None,
+        ));
+    }
+    let wo_token = create_token(&root_keypair, Role::WatchOnly, None);
+
+    // hub setup
+    write_hub_config(
+        &cosigner_xpubs,
+        threshold_colored,
+        threshold_vanilla,
+        root_public_key.to_bytes_hex(),
+        None,
+    );
+    restart_multisig_hub();
+
+    // multisig wallets
+    let multisig_wlt_keys =
+        MultisigKeys::new(cosigners.clone(), threshold_colored, threshold_vanilla);
+    let mut wlt_1_multisig = get_test_ms_wallet(&multisig_wlt_keys, format!("{random_str}_1"));
+    let wlt_1_multisig_online = ms_go_online(&mut wlt_1_multisig, &cosigner_tokens[0]);
+    let mut wlt_2_multisig = get_test_ms_wallet(&multisig_wlt_keys, format!("{random_str}_2"));
+    let wlt_2_multisig_online = ms_go_online(&mut wlt_2_multisig, &cosigner_tokens[1]);
+    let wlt_1_singlesig = get_test_wallet_with_keys(&wlt_1_keys);
+    let wlt_2_singlesig = get_test_wallet_with_keys(&wlt_2_keys);
+    let mut wlt_wo_multisig = get_test_ms_wallet(&multisig_wlt_keys, format!("{random_str}_wo"));
+    let wlt_wo_multisig_online = ms_go_online(&mut wlt_wo_multisig, &wo_token);
+    let mut wlt_1 = ms_party!(
+        &wlt_1_singlesig,
+        &mut wlt_1_multisig,
+        wlt_1_multisig_online,
+        &cosigner_xpubs[0]
+    );
+    let mut wlt_2 = ms_party!(
+        &wlt_2_singlesig,
+        &mut wlt_2_multisig,
+        wlt_2_multisig_online,
+        &cosigner_xpubs[1]
+    );
+    let mut wlt_wo = ms_party!(&mut wlt_wo_multisig, wlt_wo_multisig_online);
+
+    // a singlesig wallet mints a bridged asset to a multisig invoice
+    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge_contract = deploy_bridge(&token_contract.address);
+    let mut minter = get_funded_party!();
+    let asset = minter.issue_asset_bfa(2, bridge_contract.address.clone(), None);
+    // (the wallet has no backup info yet, which the witness_receive helper checks)
+    let receive_data = wlt_1.witness_receive_res().unwrap();
+    op_counter_bump();
+    sync_wallets_full(&mut [&mut wlt_2]);
+    let recipient = Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: Some(WitnessData {
+            amount_sat: 1000,
+            blinding: None,
+        }),
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: None,
+        encryption: Encryption::Optional,
+    };
+    minter.mint_begin(minter.online, &asset.asset_id, recipient);
+
+    // every cosigner refuses it, without checking it, so no lock is made for it (temporary, see
+    // MultisigWallet)
+    for wlt in [&mut wlt_1, &mut wlt_2] {
+        wlt.wait_for_refresh(None);
+        assert!(
+            wlt.multisig
+                .get_received_mint(receive_data.recipient_id.clone())
+                .unwrap()
+                .is_empty()
+        );
+    }
+    check_transfer_status(
+        &[&wlt_1, &wlt_2],
+        &[None],
+        None,
+        Some(receive_data.batch_transfer_idx),
+        TransferStatus::Failed,
+    );
+
+    // so does the watch-only
+    watch_only_wallet_sync(&mut wlt_wo);
+    let wo_online = wlt_wo.online();
+    wlt_wo
+        .multisig_mut()
+        .refresh(wo_online, None, vec![], false)
+        .unwrap();
+    let transfer = wlt_wo
+        .list_transfers(None)
+        .into_iter()
+        .find(|t| t.batch_transfer_idx == receive_data.batch_transfer_idx)
+        .unwrap();
+    assert_eq!(transfer.status, TransferStatus::Failed);
+    assert!(
+        wlt_wo
+            .multisig
+            .get_received_mint(receive_data.recipient_id.clone())
+            .unwrap()
+            .is_empty()
     );
 }
