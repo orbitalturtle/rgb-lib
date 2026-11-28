@@ -13685,3 +13685,57 @@ fn other_assets_amounts_past_u64() {
     );
     assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, AMOUNT);
 }
+
+/// The inputs of a send are in a stable order, so preparing it twice gives the same ones.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn stable_input_order() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // allocations on multiple UTXOs, all needed by the send
+    let asset = party.issue_asset_nia(Some(&[AMOUNT, AMOUNT, AMOUNT, AMOUNT]));
+    let receive_data = rcv_party.witness_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id,
+        vec![Recipient {
+            assignment: Assignment::Fungible(AMOUNT * 4),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    for _ in 0..5 {
+        let begin = party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map.clone(),
+                true,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                default_send_expiration(),
+                Some(PROXY_ENDPOINT.clone()),
+                true,
+            )
+            .unwrap();
+        let inputs: Vec<_> = Psbt::from_str(&begin.psbt)
+            .unwrap()
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect();
+        assert!(inputs.len() > 1);
+        assert!(inputs.is_sorted());
+    }
+}

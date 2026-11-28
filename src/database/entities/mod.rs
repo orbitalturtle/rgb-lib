@@ -36,6 +36,8 @@ pub mod rgb_secret_seal_opout;
 pub mod rgb_type_lib;
 pub mod rgb_witness;
 pub mod rgb_witness_ord;
+#[cfg(all(feature = "silent_payments", feature = "_online"))]
+pub mod silent_payment_output;
 pub mod token;
 pub mod token_media;
 pub mod transfer;

@@ -26,6 +26,7 @@ pub struct Model {
     pub operation_secret_key: Option<Vec<u8>>,
     pub broadcast_deadline: Option<i64>,
     pub retention_deadline: Option<i64>,
+    pub tx_released: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -41,6 +42,7 @@ pub enum Column {
     OperationSecretKey,
     BroadcastDeadline,
     RetentionDeadline,
+    TxReleased,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -76,6 +78,7 @@ impl ColumnTrait for Column {
             Self::OperationSecretKey => ColumnType::VarBinary(StringLen::None).def().null(),
             Self::BroadcastDeadline => ColumnType::BigInteger.def().null(),
             Self::RetentionDeadline => ColumnType::BigInteger.def().null(),
+            Self::TxReleased => ColumnType::Boolean.def(),
         }
     }
 }

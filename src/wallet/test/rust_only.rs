@@ -114,7 +114,41 @@ fn success() {
     assert_eq!(seal.vout.into_u32(), vout);
     assert_eq!(seal.blinding, blinding);
 
-    // color PSBT and consume
+    // a TX other than the colored one is refused
+    let mut other_tx = psbt.unsigned_tx.clone();
+    other_tx.output.pop();
+    let result = party_send.wallet.create_consignments_from_fascia(
+        fascia.clone(),
+        beneficiaries.clone(),
+        Some(other_tx),
+    );
+    assert_matches!(result, Err(Error::InvalidTxid));
+
+    // create the consignments, without a signed TX and with one (a witness doesn't change the TXID)
+    let unsigned_transfers = party_send
+        .wallet
+        .create_consignments_from_fascia(fascia.clone(), beneficiaries.clone(), None)
+        .unwrap();
+    let mut signed_tx = psbt.unsigned_tx.clone();
+    signed_tx.input[0].witness.push([1; 64]);
+    let signed_transfers = party_send
+        .wallet
+        .create_consignments_from_fascia(fascia.clone(), beneficiaries, Some(signed_tx.clone()))
+        .unwrap();
+    for (transfers, tx) in [
+        (&unsigned_transfers, &psbt.unsigned_tx),
+        (&signed_transfers, &signed_tx),
+    ] {
+        assert_eq!(transfers.len(), 1);
+        let bundle = transfers[0]
+            .bundles
+            .iter()
+            .find(|b| b.witness_id() == signed_tx.compute_txid())
+            .unwrap();
+        assert_eq!(&bundle.tx, tx);
+    }
+
+    // color PSBT and consume (the RGB state is still there, as it hasn't been consumed)
     let transfers = party_send
         .wallet
         .color_psbt_and_consume(&mut psbt_copy, coloring_info)
@@ -128,8 +162,8 @@ fn success() {
     let transfers_dir = party_send.wallet.get_transfers_dir().join(&txid);
     let consignment_path = transfers_dir.join(CONSIGNMENT_FILE.as_str());
     std::fs::create_dir_all(&transfers_dir).unwrap();
-    assert_eq!(transfers.len(), 1);
-    transfers
+    assert_eq!(transfers, unsigned_transfers);
+    signed_transfers
         .first()
         .unwrap()
         .save_file(&consignment_path)
@@ -1143,6 +1177,72 @@ fn create_consignments_success() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+fn create_consignments_signed() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    for donation in [true, false] {
+        let asset = party.issue_asset_nia(None);
+        let receive_data = rcv_party.blind_receive_asset_expiry(None, None);
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(10),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let begin = party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map,
+                donation,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                default_send_expiration(),
+                Some(PROXY_ENDPOINT.clone()),
+                false,
+            )
+            .unwrap();
+        let unsigned_tx = Psbt::from_str(&begin.psbt).unwrap().unsigned_tx;
+        let signed_psbt = party.wallet.sign_psbt(begin.psbt.clone(), None).unwrap();
+        let signed_tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+        assert_ne!(signed_tx, unsigned_tx);
+        let txid = signed_tx.compute_txid();
+        let consignment_path = party
+            .wallet
+            .get_send_consignment_path(&asset.asset_id, &txid.to_string());
+        let witness_tx = || {
+            let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
+            let bundle = consignment
+                .bundles
+                .iter()
+                .find(|b| b.witness_id() == txid)
+                .unwrap();
+            bundle.tx.clone()
+        };
+
+        // unsigned PSBT: the unsigned TX is embedded
+        party.wallet.create_consignments(begin.psbt).unwrap();
+        assert_eq!(witness_tx(), unsigned_tx);
+
+        // signed PSBT: the signed TX is only embedded for donations
+        party.wallet.create_consignments(signed_psbt).unwrap();
+        let expected = if donation { &signed_tx } else { &unsigned_tx };
+        assert_eq!(&witness_tx(), expected);
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 fn offline() {
     initialize();
 
@@ -1224,4 +1324,121 @@ fn list_asset_media_fail() {
     let unknown_asset_id = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E".to_string();
     let result = party.wallet.list_asset_media(unknown_asset_id);
     assert!(matches!(result, Err(Error::AssetNotFound { asset_id: _ })));
+}
+
+/// Once the consignments of a donation carry its signed TX, the transfer can't be failed while the
+/// TX can still confirm, and it's completed if somebody else broadcasts it.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn create_consignments_released() {
+    initialize();
+
+    let mut rcv_party = get_funded_party!();
+    // begin a donation, returning its batch transfer idx, the signed PSBT and its TX
+    let mut begin = |party: &mut SinglesigParty| {
+        let asset = party.issue_asset_nia(None);
+        let receive_data = rcv_party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![blind_recipient(&receive_data, Assignment::Fungible(10))],
+        )]);
+        let begin = party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map,
+                true,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                default_send_expiration(),
+                Some(PROXY_ENDPOINT.clone()),
+                false,
+            )
+            .unwrap();
+        let signed_psbt = party.wallet.sign_psbt(begin.psbt.clone(), None).unwrap();
+        let tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+        let idx = begin.batch_transfer_idx.unwrap();
+        (asset.asset_id, idx, begin.psbt, signed_psbt, tx)
+    };
+    let status = |party: &SinglesigParty, idx| party.db_batch_transfer(idx).status;
+
+    // not released: consignments with the unsigned TX don't prevent failing the transfer
+    let mut party = get_funded_party!();
+    let (_, idx, psbt, _, _) = begin(&mut party);
+    party.wallet.create_consignments(psbt).unwrap();
+    assert!(party.fail_transfers_single(idx));
+    assert_eq!(status(&party, idx), TransferStatus::Failed);
+
+    // released: the fail is denied and nothing changes until the TX is on-chain
+    let mut party = get_funded_party!();
+    let (asset_id, idx, _, signed_psbt, tx) = begin(&mut party);
+    party.wallet.create_consignments(signed_psbt).unwrap();
+    assert!(party.db_batch_transfer(idx).tx_released);
+    assert_matches!(
+        party.fail_transfers(Some(idx), false, false),
+        Err(Error::CannotFailBatchTransfer)
+    );
+    party.refresh_all();
+    assert_eq!(status(&party, idx), TransferStatus::Initiated);
+    // somebody else broadcasts the TX
+    party.wallet.indexer().broadcast(&tx).unwrap();
+    assert!(wait_for_function(
+        || {
+            party.refresh_all();
+            status(&party, idx) == TransferStatus::WaitingConfirmations
+        },
+        30,
+        500
+    ));
+    mine(false);
+    assert!(wait_for_function(
+        || {
+            party.refresh_all();
+            status(&party, idx) == TransferStatus::Settled
+        },
+        30,
+        500
+    ));
+    // the RGB change is tracked
+    assert_eq!(party.get_asset_balance(&asset_id).settled, AMOUNT - 10);
+
+    // released: the send can still be ended
+    let mut party = get_funded_party!();
+    let (_, idx, _, signed_psbt, _) = begin(&mut party);
+    party
+        .wallet
+        .create_consignments(signed_psbt.clone())
+        .unwrap();
+    party.wallet.send_end(party.online, signed_psbt).unwrap();
+    assert_eq!(status(&party, idx), TransferStatus::WaitingConfirmations);
+
+    // released: the transfer fails once its TX can no longer confirm
+    let mut party = get_funded_party!();
+    let (_, idx, _, signed_psbt, tx) = begin(&mut party);
+    party.wallet.create_consignments(signed_psbt).unwrap();
+    let address = BdkAddress::from_str(&party.get_address()).unwrap();
+    let mut tx_builder = party.wallet.bdk_wallet_mut().build_tx();
+    tx_builder
+        .add_utxo(tx.input[0].previous_output)
+        .unwrap()
+        .manually_selected_only()
+        .drain_to(address.assume_checked().script_pubkey())
+        .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
+    let psbt = tx_builder.finish().unwrap();
+    let signed_psbt = party.wallet.sign_psbt(psbt.to_string(), None).unwrap();
+    let other_tx = Psbt::from_str(&signed_psbt).unwrap().extract_tx().unwrap();
+    party.wallet.broadcast_tx(other_tx).unwrap();
+    party.refresh_all();
+    assert_eq!(status(&party, idx), TransferStatus::Initiated);
+    mine(false);
+    assert!(wait_for_function(
+        || {
+            party.list_unspents_with_sync(false);
+            party.refresh_all();
+            status(&party, idx) == TransferStatus::Failed
+        },
+        30,
+        500
+    ));
 }

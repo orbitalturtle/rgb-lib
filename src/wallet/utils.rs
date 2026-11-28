@@ -20,6 +20,14 @@ pub(crate) const RGB_RUNTIME_DELETING_DIR: &str = "rgb.deleting";
 pub(crate) const LOG_FILE: &str = "log";
 
 pub(crate) const PURPOSE: u8 = 86;
+/// The `PSBT_IN_SP_TWEAK` field, with no key data. Borrowed from BIP376 (draft), which only allows
+/// it in version 2 PSBTs while the ones here are version 0: it only carries the tweak from the
+/// preparation of a PSBT to its signing by the same wallet.
+#[cfg(feature = "_online")]
+pub(crate) const PSBT_IN_SP_TWEAK: bitcoin::psbt::raw::Key = bitcoin::psbt::raw::Key {
+    type_value: 0x20,
+    key: vec![],
+};
 pub(crate) const COIN_RGB_MAINNET: u32 = 827166;
 pub(crate) const COIN_RGB_TESTNET: u32 = 827167;
 pub(crate) const ACCOUNT: u8 = 0;

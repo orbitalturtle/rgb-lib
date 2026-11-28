@@ -1496,6 +1496,16 @@ impl From<LocalOutput> for Utxo {
     }
 }
 
+/// What is needed to spend a received output BDK doesn't know about.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "_online"), allow(dead_code))]
+pub(crate) struct ForeignOutput {
+    /// Tweak of the key
+    pub(crate) tweak: Vec<u8>,
+    /// Serialized TX of the output
+    pub(crate) tx: Vec<u8>,
+}
+
 /// A wallet unspent.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]

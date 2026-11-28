@@ -2,16 +2,17 @@
 //!
 //! This module defines the online wallet methods.
 
-use super::*;
+use super::{objects::ForeignOutput, utils::PSBT_IN_SP_TWEAK, *};
 
-/// Signed TX of an outgoing transfer, saved to broadcast it once the transfer is accepted
-const SIGNED_TX_FILE: &str = "signed.tx";
 /// Signed PSBT of an outgoing transfer, saved instead of its TX by previous versions
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
 /// Signed TX released to a recipient, saved to broadcast it again until the broadcast deadline
 const RECEIVED_SIGNED_TX_FILE: &str = "rcv_signed.tx";
 
 const MIN_FEE_RATE: u64 = 1;
+
+/// Derives the script paying the recipient of a send from its PSBT, once its inputs are final.
+pub(crate) type DeriveScript<'a> = &'a dyn Fn(&Psbt) -> Result<ScriptBuf, Error>;
 
 pub(crate) const UTXO_SIZE: u32 = 1000;
 pub(crate) const UTXO_NUM: u8 = 5;
@@ -397,6 +398,27 @@ impl ResolveRejectList for WalletRejectListResolver<'_> {
         }
         Ok(reject_list)
     }
+}
+
+/// The weight of the witness of a taproot key path spend (with a default sighash).
+const TAPROOT_KEY_SPEND_WEIGHT: bitcoin::Weight = bitcoin::Weight::from_wu(66);
+
+/// The PSBT input spending a foreign output, carrying its tweak (see
+/// [`PSBT_IN_SP_TWEAK`]).
+fn foreign_psbt_input(
+    outpoint: BdkOutPoint,
+    foreign: &ForeignOutput,
+) -> Result<bitcoin::psbt::Input, Error> {
+    let tx: BdkTransaction = bitcoin::consensus::encode::deserialize(&foreign.tx)
+        .map_err(|_| InternalError::Unexpected)?;
+    let witness_utxo = tx.output.get(outpoint.vout as usize).cloned();
+    Ok(bitcoin::psbt::Input {
+        witness_utxo: Some(witness_utxo.ok_or(InternalError::Unexpected)?),
+        // BDK refuses to sign without it
+        non_witness_utxo: Some(tx),
+        unknown: BTreeMap::from([(PSBT_IN_SP_TWEAK, foreign.tweak.clone())]),
+        ..Default::default()
+    })
 }
 
 pub trait WalletOnline: WalletOffline {
@@ -1088,6 +1110,15 @@ pub trait WalletOnline: WalletOffline {
                 return Ok(TryFailBatchTransferOutcome::Failed);
             }
             return Ok(TryFailBatchTransferOutcome::Refreshed);
+        }
+        // the signed TX may be held by others, who can broadcast it at any time: the refresh above
+        // fails the transfer once the TX can no longer confirm, until then the fail is denied
+        if batch_transfer.initiated_and_released() {
+            info!(
+                self.logger(),
+                "The signed TX of the transfer was released, fail denied"
+            );
+            return Ok(TryFailBatchTransferOutcome::Denied);
         }
         // the refresh above may have been the first to check a received mint (see `is_mint`): the
         // fail is denied, as a mint expires only by its lock, which may have been made already, in
@@ -4787,6 +4818,27 @@ pub trait WalletOnline: WalletOffline {
         Ok(Some(self.broadcast_batch(txn, batch_transfer)?))
     }
 
+    /// Settle an initiated outgoing batch transfer whose signed TX was released (see
+    /// [`DbBatchTransfer::initiated_and_released`]): complete it if its TX is on-chain, fail it if
+    /// the TX can never confirm, otherwise leave it as is, as the TX may still be broadcast.
+    fn settle_released_batch(
+        &mut self,
+        txn: &DbTxn,
+        batch_transfer: &DbBatchTransfer,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        if let Some(updated) = self.complete_batch_if_tx_on_chain(txn, batch_transfer)? {
+            return Ok(Some(updated));
+        }
+        if self.tx_inputs_spent_elsewhere(batch_transfer)? {
+            info!(
+                self.logger(),
+                "An input of the released TX has been spent by another confirmed transaction, failing the transfer"
+            );
+            return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
+        }
+        Ok(None)
+    }
+
     fn provide_out_of_band_ack_impl(
         &mut self,
         txn: &DbTxn,
@@ -5080,15 +5132,19 @@ pub trait WalletOnline: WalletOffline {
         debug!(self.logger(), "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming;
         if !filter.is_empty() {
-            let requested = RefreshFilter {
-                status: RefreshTransferStatus::try_from(transfer.status).expect("pending status"),
-                incoming,
+            // there is no filter for an initiated transfer
+            let Ok(status) = RefreshTransferStatus::try_from(transfer.status) else {
+                return Ok(None);
             };
+            let requested = RefreshFilter { status, incoming };
             if !filter.contains(&requested) {
                 return Ok(None);
             }
         }
         match transfer.status {
+            TransferStatus::Initiated if transfer.initiated_and_released() => {
+                self.settle_released_batch(txn, transfer)
+            }
             TransferStatus::WaitingCounterparty => {
                 if self.get_hub_fail_status(transfer.idx)? {
                     return Ok(Some(self.fail_batch_transfer(txn, transfer)?));
@@ -5315,7 +5371,9 @@ pub trait WalletOnline: WalletOffline {
                 .batch_transfers
                 .retain(|t| batch_transfers_ids.contains(&t.idx));
         };
-        db_data.batch_transfers.retain(|t| t.waiting());
+        db_data
+            .batch_transfers
+            .retain(|t| t.waiting() || t.initiated_and_released());
 
         let mut refresh_result = HashMap::new();
         for transfer in &db_data.batch_transfers {
@@ -5552,16 +5610,33 @@ pub trait WalletOnline: WalletOffline {
 
     fn prepare_psbt(
         &mut self,
+        txn: &DbTxn,
         input_outpoints: HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let change_addr = self.get_new_address()?.script_pubkey();
+        // the order of the set is random: sort it so the same inputs give the same TX
+        let mut input_outpoints: Vec<BdkOutPoint> = input_outpoints.into_iter().collect();
+        input_outpoints.sort_unstable();
+        let foreign_outputs = txn.get_foreign_outputs()?;
         let mut builder = self.bdk_wallet_mut().build_tx();
+        for outpoint in input_outpoints {
+            match foreign_outputs.get(&outpoint.into()) {
+                Some(foreign) => builder
+                    .add_foreign_utxo(
+                        outpoint,
+                        foreign_psbt_input(outpoint, foreign)?,
+                        TAPROOT_KEY_SPEND_WEIGHT,
+                    )
+                    .map_err(|e| Error::Internal {
+                        details: e.to_string(),
+                    })?,
+                None => builder.add_utxo(outpoint).map_err(InternalError::from)?,
+            };
+        }
         builder
             .add_data(&[0; 32])
-            .add_utxos(&input_outpoints.into_iter().collect::<Vec<_>>())
-            .map_err(InternalError::from)?
             .manually_selected_only()
             .fee_rate(fee_rate)
             .ordering(bdk_wallet::tx_builder::TxOrdering::Untouched);
@@ -5603,13 +5678,14 @@ pub trait WalletOnline: WalletOffline {
 
     fn try_prepare_psbt(
         &mut self,
+        txn: &DbTxn,
         input_unspents: &[LocalUnspent],
         all_inputs: &mut HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         Ok(loop {
-            break match self.prepare_psbt(all_inputs.clone(), witness_recipients, fee_rate) {
+            break match self.prepare_psbt(txn, all_inputs.clone(), witness_recipients, fee_rate) {
                 Ok(res) => res,
                 Err(Error::InsufficientBitcoins { .. }) => {
                     let used_txos: Vec<Outpoint> =
@@ -6998,14 +7074,19 @@ pub trait WalletOnline: WalletOffline {
         }
     }
 
-    fn get_input_unspents(&self, unspents: &[LocalUnspent]) -> Result<Vec<LocalUnspent>, Error> {
+    fn get_input_unspents(
+        &self,
+        txn: &DbTxn,
+        unspents: &[LocalUnspent],
+    ) -> Result<Vec<LocalUnspent>, Error> {
         let mut input_unspents = unspents.to_vec();
         // consider the following UTXOs unspendable:
         // - incoming and pending
         // - outgoing and in initiated or waiting counterparty status
         // - pending incoming witness
         // - pending incoming blinded
-        // - inexistent
+        // - inexistent, unless foreign
+        let foreign = txn.get_foreign_outputs()?;
         input_unspents.retain(|u| {
             !(u.rgb_allocations
                 .iter()
@@ -7015,7 +7096,7 @@ pub trait WalletOnline: WalletOffline {
                 }))
                 && !u.utxo.pending_witness
                 && u.pending_blinded == 0
-                && u.utxo.exists
+                && (u.utxo.exists || foreign.contains_key(&u.utxo.outpoint()))
         });
         Ok(input_unspents)
     }
@@ -7054,9 +7135,9 @@ pub trait WalletOnline: WalletOffline {
         unspents.retain(|u| !reserved.contains(&u.utxo.outpoint()));
 
         #[cfg(test)]
-        let input_unspents = mock_input_unspents(self, &unspents);
+        let input_unspents = mock_input_unspents(self, txn, &unspents);
         #[cfg(not(test))]
-        let input_unspents = self.get_input_unspents(&unspents)?;
+        let input_unspents = self.get_input_unspents(txn, &unspents)?;
 
         let stock = self.rgb_stock(txn)?;
 
@@ -7274,6 +7355,47 @@ pub trait WalletOnline: WalletOffline {
         Ok(transfer_dir)
     }
 
+    /// Set the script paying the only recipient of a send, in both its PSBT and its recipient ID.
+    fn set_recipient_script(
+        &self,
+        psbt: &mut Psbt,
+        transfer_info_map: &mut BTreeMap<String, InfoAssetTransfer>,
+        script: ScriptBuf,
+    ) -> Result<(), Error> {
+        let invalid = |details: String| Error::InvalidRecipientData { details };
+        let mut recipients: Vec<&mut LocalRecipient> = transfer_info_map
+            .values_mut()
+            .flat_map(|t| t.recipients.iter_mut())
+            .collect();
+        let [recipient] = recipients.as_mut_slice() else {
+            return Err(invalid(s!("a single recipient is needed")));
+        };
+        let LocalRecipientData::Witness(witness_data) = &recipient.local_recipient_data else {
+            return Err(invalid(s!("a witness recipient is needed")));
+        };
+        // the recipient ID is part of the proxy IDs, already checked by now
+        if !recipient.transport_endpoints.is_empty() {
+            return Err(invalid(s!("the recipient cannot use a proxy")));
+        }
+        if psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|o| o.script_pubkey == script)
+        {
+            return Err(invalid(s!("the script is already paid")));
+        }
+        let output = &mut psbt.unsigned_tx.output[witness_data.vout as usize];
+        // the fee has been computed on the placeholder
+        if output.script_pubkey.len() != script.len() {
+            return Err(invalid(s!("the script differs in size")));
+        }
+        recipient.recipient_id =
+            crate::no_wallet::recipient_id_from_script_buf(script.clone(), self.bitcoin_network());
+        output.script_pubkey = script;
+        Ok(())
+    }
+
     /// Prepare the PSBT of an operation on a single asset (an inflation, a burn or a mint),
     /// retrying, as a send does, without the inputs found rejected by the asset's reject list:
     /// more inputs are then selected to make up for them, failing if there aren't enough.
@@ -7319,6 +7441,7 @@ pub trait WalletOnline: WalletOffline {
                 &mut rejected,
                 &mut reject_lists,
                 dry_run,
+                None,
             )? {
                 PrepareTransferPsbtResult::Retry => {
                     // start over from the original transfer info, with the assignments needed
@@ -7368,6 +7491,7 @@ pub trait WalletOnline: WalletOffline {
         rejected: &mut HashSet<Opout>,
         reject_lists: &mut HashMap<RejectListSource, RejectList>,
         dry_run: bool,
+        derive_script: Option<DeriveScript<'_>>,
     ) -> Result<PrepareTransferPsbtResult, Error> {
         // prepare BDK PSBT
         let mut all_inputs: HashSet<BdkOutPoint> = transfer_info_map
@@ -7380,12 +7504,19 @@ pub trait WalletOnline: WalletOffline {
             })
             .collect();
         let (mut psbt, btc_change) = self.try_prepare_psbt(
+            txn,
             input_unspents,
             &mut all_inputs,
             witness_recipients,
             fee_rate_checked,
         )?;
         psbt.unsigned_tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
+
+        // the inputs are final: replace the placeholder paying the recipient
+        if let Some(derive_script) = derive_script {
+            let script = derive_script(&psbt)?;
+            self.set_recipient_script(&mut psbt, transfer_info_map, script)?;
+        }
 
         // prepare RGB PSBT
         let begin_operation_data = match self.prepare_rgb_psbt(
@@ -7481,6 +7612,35 @@ pub trait WalletOnline: WalletOffline {
         expiration_timestamp: Option<i64>,
         sender_transport_endpoint: Option<String>,
         dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        self.send_begin_derived_impl(
+            txn,
+            recipient_map,
+            donation,
+            fee_rate,
+            min_confirmations,
+            expiration_timestamp,
+            sender_transport_endpoint,
+            dry_run,
+            None,
+        )
+    }
+
+    /// Begin a send, optionally deriving the script paying its recipient from its final inputs, in
+    /// which case there must be a single witness recipient, paid to a placeholder script of the
+    /// same size and using the out-of-band exchange.
+    #[allow(clippy::too_many_arguments)]
+    fn send_begin_derived_impl(
+        &mut self,
+        txn: &DbTxn,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        donation: bool,
+        fee_rate: u64,
+        min_confirmations: u8,
+        expiration_timestamp: Option<i64>,
+        sender_transport_endpoint: Option<String>,
+        dry_run: bool,
+        derive_script: Option<DeriveScript<'_>>,
     ) -> Result<BeginOperationData, Error> {
         if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
             return Err(Error::InvalidRecipientMap);
@@ -7707,6 +7867,7 @@ pub trait WalletOnline: WalletOffline {
                 &mut rejected,
                 &mut reject_lists,
                 dry_run,
+                derive_script,
             )? {
                 PrepareTransferPsbtResult::Retry => continue,
                 PrepareTransferPsbtResult::Success(begin_operation_data) => {
@@ -9127,6 +9288,7 @@ mod tests {
             operation_secret_key: None,
             broadcast_deadline,
             retention_deadline: None,
+            tx_released: false,
         }
     }
 

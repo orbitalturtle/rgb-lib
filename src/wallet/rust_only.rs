@@ -27,6 +27,24 @@ pub struct ColoringInfo {
 /// Map of contract ID and list of its beneficiaries
 pub type AssetBeneficiariesMap = BTreeMap<ContractId, Vec<BuilderSeal<GraphSeal>>>;
 
+/// Split beneficiaries between the ones paid to outputs of the witness TX and the blinded ones.
+fn split_beneficiaries(
+    beneficiaries: Vec<BuilderSeal<GraphSeal>>,
+    witness_txid: RgbTxid,
+) -> (Vec<OutputSeal>, Vec<SecretSeal>) {
+    let mut beneficiaries_witness = vec![];
+    let mut beneficiaries_blinded = vec![];
+    for builder_seal in beneficiaries {
+        match builder_seal {
+            BuilderSeal::Revealed(seal) => {
+                beneficiaries_witness.push(ExplicitSeal::with(witness_txid, seal.vout));
+            }
+            BuilderSeal::Concealed(secret_seal) => beneficiaries_blinded.push(secret_seal),
+        };
+    }
+    (beneficiaries_witness, beneficiaries_blinded)
+}
+
 /// Check whether the provided URL points to a valid proxy.
 /// An error is raised if the provided proxy URL is invalid or if the service is running an
 /// unsupported protocol version.
@@ -250,19 +268,8 @@ impl Wallet {
 
         let mut transfers = vec![];
         for (contract_id, beneficiaries) in asset_beneficiaries {
-            let mut beneficiaries_witness = vec![];
-            let mut beneficiaries_blinded = vec![];
-            for builder_seal in beneficiaries {
-                match builder_seal {
-                    BuilderSeal::Revealed(seal) => {
-                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
-                        beneficiaries_witness.push(explicit_seal);
-                    }
-                    BuilderSeal::Concealed(secret_seal) => {
-                        beneficiaries_blinded.push(secret_seal);
-                    }
-                };
-            }
+            let (beneficiaries_witness, beneficiaries_blinded) =
+                split_beneficiaries(beneficiaries, witness_txid);
             let (consignment, spv_proofs) = stock.transfer(
                 contract_id,
                 beneficiaries_witness,
@@ -279,6 +286,87 @@ impl Wallet {
         Ok(transfers)
     }
 
+    /// Create the consignments of a PSBT colored with [`color_psbt`](Wallet::color_psbt), without
+    /// consuming its fascia.
+    ///
+    /// The fascia and the beneficiaries are the ones returned by the coloring. If the signed TX is
+    /// provided, it is embedded in the consignments so also the recipients can broadcast it. It
+    /// must have the same TXID as the colored PSBT.
+    ///
+    /// Once the TX has been broadcast the fascia needs to be consumed with
+    /// [`consume_fascia`](Wallet::consume_fascia). If the TX is never broadcast, the RGB state is
+    /// left untouched.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn create_consignments_from_fascia(
+        &self,
+        mut fascia: Fascia,
+        asset_beneficiaries: AssetBeneficiariesMap,
+        signed_tx: Option<BdkTransaction>,
+    ) -> Result<Vec<RgbTransfer>, Error> {
+        info!(self.logger(), "Creating consignments from fascia...");
+        let witness_txid = fascia.witness_id();
+        if let Some(tx) = signed_tx {
+            if tx.compute_txid() != witness_txid {
+                return Err(Error::InvalidTxid);
+            }
+            fascia.update_witness_tx(tx);
+        }
+
+        let txn = self.database().begin_transaction()?;
+        let mut stock = self.rgb_stock(&txn)?;
+        let mut transfers = vec![];
+        for (contract_id, beneficiaries) in asset_beneficiaries {
+            let (beneficiaries_witness, beneficiaries_blinded) =
+                split_beneficiaries(beneficiaries, witness_txid);
+            let (consignment, spv_proofs) = stock.transfer_from_fascia(
+                contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                [],
+                &fascia,
+                self.spv_resolver(),
+            )?;
+            stock.store_spv_proofs(spv_proofs)?;
+            transfers.push(consignment);
+        }
+        txn.commit()?;
+
+        info!(self.logger(), "Create consignments from fascia completed");
+        Ok(transfers)
+    }
+
+    /// Mark the TX of an initiated transfer as released, if it's signed.
+    #[cfg(feature = "_online")]
+    fn release_tx(
+        &self,
+        txid: &str,
+        tx: &BdkTransaction,
+        transfer_dir: &Path,
+    ) -> Result<(), Error> {
+        if tx.input.iter().any(|i| i.witness.is_empty()) {
+            return Ok(());
+        }
+        let txn = self.database().begin_transaction()?;
+        let Some(batch_transfer) = txn
+            .get_batch_transfers_by_txid(txid)?
+            .into_iter()
+            .find(|bt| !bt.incoming && bt.status.initiated())
+        else {
+            return Ok(());
+        };
+        atomic_write(
+            &transfer_dir.join(SIGNED_TX_FILE),
+            hex::encode(bdk_wallet::bitcoin::consensus::encode::serialize(tx)).as_bytes(),
+        )?;
+        let mut updated: DbBatchTransferActMod = batch_transfer.into();
+        updated.tx_released = ActiveValue::Set(true);
+        txn.update_batch_transfer(&mut updated)?;
+        self.update_backup_info(&txn, false)?;
+        txn.commit()
+    }
+
     /// Create consignments for a PSBT created with the
     #[cfg_attr(
         feature = "_online",
@@ -286,13 +374,31 @@ impl Wallet {
     )]
     #[cfg_attr(not(feature = "_online"), doc = "`send_begin` method.")]
     ///
+    /// If the transfer is a donation the TX of the PSBT is embedded in the consignments, so
+    /// providing the signed PSBT allows also the recipients to broadcast it. Otherwise the
+    /// consignments always carry the unsigned TX.
+    ///
+    /// From when a signed TX is embedded anybody given the consignments can broadcast it, so the
+    /// transfer (unless begun as a dry run, which persists none) can no longer be failed until one
+    /// of its inputs has been spent by another confirmed transaction. The send can still be ended,
+    /// while a refresh completes it if the TX is found on-chain.
+    ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
     pub fn create_consignments(&self, psbt: String) -> Result<(), Error> {
         info!(self.logger(), "Creating consignments...");
 
         let psbt = Psbt::from_str(&psbt)?;
-        let (_, transfer_dir, info_contents, fascia) = self.get_transfer_end_data(&psbt)?;
+        #[cfg_attr(not(feature = "_online"), allow(unused_variables))]
+        let (txid, transfer_dir, info_contents, mut fascia) = self.get_transfer_end_data(&psbt)?;
+        if info_contents.donation {
+            let tx = psbt.extract_tx().map_err(InternalError::from)?;
+            // persisted before the consignments exist, so no consignment can carry the signed TX
+            // of a transfer that can still be failed
+            #[cfg(feature = "_online")]
+            self.release_tx(&txid, &tx, &transfer_dir)?;
+            fascia.update_witness_tx(tx);
+        }
         let txn = self.database().begin_transaction()?;
         self.gen_consignments(&txn, &fascia, &info_contents.transfers, &transfer_dir)?;
         txn.commit()?;

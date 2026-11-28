@@ -1722,8 +1722,10 @@ pub trait WalletOffline: WalletBackup {
                     }
                 });
         }
-        for txo in txos_to_delete {
-            txn.del_txo(txo)?;
+        // a foreign output is also used by the transfer that received it
+        let used_txos: HashSet<i32> = txn.iter_colorings()?.iter().map(|c| c.txo_idx).collect();
+        for txo in txos_to_delete.difference(&used_txos) {
+            txn.del_txo(*txo)?;
         }
         txn.del_batch_transfer(batch_transfer)
     }

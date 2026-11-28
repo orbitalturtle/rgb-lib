@@ -92,6 +92,13 @@ impl DbBatchTransfer {
     }
 
     #[cfg(feature = "_online")]
+    /// Whether the signed TX was released (it's in the consignments created for a donation) before
+    /// ending the send: whoever holds it can broadcast it at any time.
+    pub(crate) fn initiated_and_released(&self) -> bool {
+        !self.incoming && self.tx_released && self.status.initiated()
+    }
+
+    #[cfg(feature = "_online")]
     /// Whether the transfer was created before the proxy protocol v1.0 (sender proxy, signed
     /// ACKs, encryption): such a transfer has no operation key and, since the protocol keeps no
     /// backward compatibility, can no longer be completed through a proxy.
@@ -488,6 +495,72 @@ impl DbTxn {
             Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    #[cfg(all(feature = "silent_payments", feature = "_online"))]
+    pub(crate) fn set_silent_payment_output(
+        &self,
+        outpoint: &Outpoint,
+        tweak: &[u8],
+        tx: &[u8],
+        batch_transfer_idx: i32,
+    ) -> Result<(), Error> {
+        let output = entities::silent_payment_output::ActiveModel {
+            outpoint: ActiveValue::Set(outpoint.to_string()),
+            tweak: ActiveValue::Set(tweak.to_vec()),
+            tx: ActiveValue::Set(tx.to_vec()),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            ..Default::default()
+        };
+        block_on(SilentPaymentOutput::insert(output).exec(self.inner()))?;
+        Ok(())
+    }
+
+    /// The index of the batch transfer that received the given silent payment output, if any.
+    #[cfg(all(feature = "silent_payments", feature = "_online"))]
+    pub(crate) fn get_silent_payment_batch_transfer(
+        &self,
+        outpoint: &Outpoint,
+    ) -> Result<Option<i32>, Error> {
+        Ok(block_on(
+            SilentPaymentOutput::find()
+                .filter(entities::silent_payment_output::Column::Outpoint.eq(outpoint.to_string()))
+                .one(self.inner()),
+        )?
+        .map(|o| o.batch_transfer_idx))
+    }
+
+    /// The received outputs BDK doesn't know about but that can be spent, with their data.
+    #[cfg(all(feature = "silent_payments", feature = "_online"))]
+    pub(crate) fn get_foreign_outputs(
+        &self,
+    ) -> Result<HashMap<Outpoint, crate::wallet::objects::ForeignOutput>, Error> {
+        block_on(SilentPaymentOutput::find().all(self.inner()))?
+            .into_iter()
+            .map(|o| {
+                let (txid, vout) = o
+                    .outpoint
+                    .split_once(':')
+                    .and_then(|(txid, vout)| Some((txid, vout.parse().ok()?)))
+                    .ok_or(InternalError::Unexpected)?;
+                let outpoint = Outpoint {
+                    txid: txid.to_string(),
+                    vout,
+                };
+                let output = crate::wallet::objects::ForeignOutput {
+                    tweak: o.tweak,
+                    tx: o.tx,
+                };
+                Ok((outpoint, output))
+            })
+            .collect()
+    }
+
+    #[cfg(not(all(feature = "silent_payments", feature = "_online")))]
+    pub(crate) fn get_foreign_outputs(
+        &self,
+    ) -> Result<HashMap<Outpoint, crate::wallet::objects::ForeignOutput>, Error> {
+        Ok(HashMap::new())
     }
 
     pub(crate) fn set_invoice(&self, invoice: DbInvoiceActMod) -> Result<i32, Error> {
@@ -1373,6 +1446,7 @@ impl DbTxn {
             .checked_sub(ass_pending_outgoing)
             .expect("pending outgoing cannot exceed available balance");
 
+        let foreign = self.get_foreign_outputs()?;
         let unspendable: u128 = txos_allocations
             .into_iter()
             .filter(|u| {
@@ -1384,6 +1458,8 @@ impl DbTxn {
                     })
                     // or with pending blinded incoming transfers
                     || u.pending_blinded > 0
+                    // or not known to BDK nor a foreign output, so never selected as inputs
+                    || (!u.utxo.exists && !foreign.contains_key(&u.utxo.outpoint()))
                     ))
                     // spent
                     || (u.utxo.spent
